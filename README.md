@@ -88,9 +88,12 @@ Key 只从后端环境读取，不提供浏览器输入/读取密钥的接口。
 
 ### 资源发现
 
-配置卡顶部的「Foundry 资源」可以直接输入名称，或从下拉列表选择；刷新按钮重新拉取列表。
+配置卡顶部的「Foundry 资源」可以直接输入名称，或从下拉列表选择。
 
-- 使用当前「日志查询身份」（Azure CLI 或 MI）调用 ARM，只读，不修改任何 Azure 资源。
+- 名称右侧的「Azure CLI / MI」开关切换发现身份，它与下方「日志查询身份」是同一设置；
+  页面加载和切换身份时自动发现，「刷新」按钮重新读取列表、部署和诊断设置。
+  修改 MI Client ID 后不会自动刷新，状态行会提示点击「刷新」。
+- 只读，不修改任何 Azure 资源。
 - 通过 Azure Resource Graph 列出该身份可访问的所有订阅中 `OpenAI` / `AIServices` 账户，最多 200 个。
 - 选择后读取账户、部署和 Diagnostic settings，自动填写 Endpoint、Resource ID、Deployment，
   并在当前 Workspace 不在日志目标中时切换到第一个接收 `RequestResponse` 的 Workspace。

@@ -1101,6 +1101,42 @@ describe("foundry discovery", () => {
     );
   });
 
+  it("switches the shared discovery identity next to the picker and flags stale lists", async () => {
+    const { calls } = await ready();
+    const listCalls = () =>
+      calls.filter((call) => call.url === "/api/discovery/foundries");
+    const identity = screen.getByRole("group", { name: "资源发现身份" });
+    expect(
+      within(identity)
+        .getByRole("button", { name: "Azure CLI" })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+    fireEvent.click(within(identity).getByRole("button", { name: "MI" }));
+    await waitFor(() => expect(listCalls()).toHaveLength(2));
+    expect(listCalls()[1].body).toEqual({
+      logs_auth_mode: "managed_identity",
+      managed_identity_client_id: "",
+    });
+    expect(screen.getByLabelText(/^日志查询身份/)).toHaveProperty(
+      "value",
+      "managed_identity",
+    );
+    await screen.findByText(/系统分配 MI：找到 3 个/);
+    const clientId = "00000000-0000-0000-0000-0000000000c1";
+    fireEvent.change(screen.getByLabelText(/用户分配 MI Client ID/), {
+      target: { value: clientId },
+    });
+    expect(screen.getByText(/身份参数已修改/)).toBeTruthy();
+    expect(listCalls()).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "刷新 Foundry 列表" }));
+    await screen.findByText(/用户分配 MI：找到 3 个/);
+    expect(listCalls().at(-1)?.body).toEqual({
+      logs_auth_mode: "managed_identity",
+      managed_identity_client_id: clientId,
+    });
+    expect(screen.queryByText(/身份参数已修改/)).toBeNull();
+  });
+
   it("keeps valid choices and flags a workspace outside the diagnostic targets", () => {
     const detail = foundryDetail(`${accountPrefix}japan-lab`);
     expect(

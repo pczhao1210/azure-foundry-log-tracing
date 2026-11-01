@@ -338,6 +338,15 @@ class AzureDiscovery:
     async def resolve(self, client: httpx.AsyncClient, target: LogTarget) -> None:
         try:
             data = await self.get(client, target.resource_id, WORKSPACE_API)
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            target.error = (
+                f"HTTP {code}：该身份无法读取此 Workspace，"
+                "需在该 Workspace 上授予 Reader / Log Analytics Reader。"
+                if code in (401, 403)
+                else describe(exc)
+            )
+            return
         except (httpx.HTTPError, ValueError) as exc:
             target.error = describe(exc)
             return

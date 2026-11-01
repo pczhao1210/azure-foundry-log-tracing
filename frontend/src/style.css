@@ -307,8 +307,54 @@ h1 {
 .warn-text {
   color: #a87739;
 }
-.foundry-picker > label {
+.picker-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 10px;
+}
+.picker-head label {
+  margin: 0;
+}
+.picker-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.segmented.mini {
   margin-top: 0;
+  padding: 2px;
+  border-radius: 6px;
+}
+.segmented.mini button {
+  flex: none;
+  padding: 3px 9px;
+  font-size: 11px;
+}
+.text-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid #dce2ee;
+  background: #fff;
+  color: #3a60c6;
+  padding: 3px 9px;
+  border-radius: 6px;
+  font-size: 11px;
+}
+.text-button:hover:not(:disabled) {
+  background: #f1f4fd;
+}
+.text-button.attention {
+  border-color: #e2b46e;
+  color: #a87739;
+  background: #fff8ec;
+}
+.picker-note {
+  margin-top: 4px;
+  font-size: 10px;
+  line-height: 1.5;
 }
 .combo {
   position: relative;

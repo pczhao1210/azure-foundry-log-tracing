@@ -32,6 +32,11 @@ function identityBody(config: Connection) {
   };
 }
 
+function identityKey(config: Connection): string {
+  const body = identityBody(config);
+  return `${body.logs_auth_mode}:${body.managed_identity_client_id.trim().toLowerCase()}`;
+}
+
 export function identityLabel(config: Connection): string {
   if (config.logs_auth_mode === "azure_cli") return "Azure CLI 身份";
   return config.managed_identity_client_id ? "用户分配 MI" : "系统分配 MI";
@@ -80,6 +85,7 @@ export function useFoundryDiscovery(config: Connection | null, change: Change) {
   const [listError, setListError] = useState("");
   const [detailError, setDetailError] = useState("");
   const [source, setSource] = useState("");
+  const [sourceKey, setSourceKey] = useState("");
   const latest = useRef(config);
   const listRequest = useRef<AbortController | null>(null);
   const detailRequest = useRef<AbortController | null>(null);
@@ -104,6 +110,7 @@ export function useFoundryDiscovery(config: Connection | null, change: Change) {
         ),
       );
       setSource(identityLabel(current));
+      setSourceKey(identityKey(current));
       // A manual refresh also re-reads deployments and diagnostic settings.
       detailKey.current = "";
     } catch (err: unknown) {
@@ -181,6 +188,10 @@ export function useFoundryDiscovery(config: Connection | null, change: Change) {
   return {
     list,
     source,
+    // The list was produced by a different identity, e.g. after editing the MI Client ID.
+    stale: Boolean(
+      list && config && !listing && sourceKey !== identityKey(config),
+    ),
     listing,
     detail: current,
     loading,
@@ -191,12 +202,19 @@ export function useFoundryDiscovery(config: Connection | null, change: Change) {
   };
 }
 
+const identityModes = [
+  { value: "azure_cli", label: "Azure CLI" },
+  { value: "managed_identity", label: "MI" },
+] as const;
+
 export function FoundryPicker({
   discovery,
   config,
+  onIdentity,
 }: {
   discovery: FoundryDiscovery;
   config: Connection;
+  onIdentity: (mode: Connection["logs_auth_mode"]) => void;
 }) {
   const [text, setText] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
@@ -271,6 +289,9 @@ export function FoundryPicker({
   else if (discovery.listError) {
     listStatus = discovery.listError;
     listWarn = true;
+  } else if (discovery.stale) {
+    listStatus += ` 身份参数已修改，点击「刷新」以${identityLabel(config)}重新发现。`;
+    listWarn = true;
   }
   let detailStatus = "";
   let detailWarn = false;
@@ -295,9 +316,42 @@ export function FoundryPicker({
 
   return (
     <div className="foundry-picker">
-      <label htmlFor={`${id}-input`}>
-        Foundry 资源 <span className="quiet">按日志查询身份发现</span>
-      </label>
+      <div className="picker-head">
+        <label htmlFor={`${id}-input`}>Foundry 资源</label>
+        <div className="picker-tools">
+          <div
+            className="segmented mini"
+            role="group"
+            aria-label="资源发现身份"
+          >
+            {identityModes.map((mode) => (
+              <button
+                key={mode.value}
+                type="button"
+                aria-pressed={config.logs_auth_mode === mode.value}
+                className={config.logs_auth_mode === mode.value ? "chosen" : ""}
+                onClick={() => onIdentity(mode.value)}
+              >
+                {mode.label}
+              </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            className={`text-button ${discovery.stale ? "attention" : ""}`}
+            aria-label="刷新 Foundry 列表"
+            title={`使用${identityLabel(config)}重新读取 Foundry、部署和诊断设置`}
+            disabled={discovery.listing}
+            onClick={() => void discovery.refresh()}
+          >
+            <RefreshCw size={13} className={discovery.listing ? "spin" : ""} />
+            刷新
+          </button>
+        </div>
+      </div>
+      <p className="hint picker-note">
+        与下方「日志查询身份」为同一设置；切换后自动重新发现。
+      </p>
       <div className="combo">
         <input
           ref={input}
@@ -336,16 +390,6 @@ export function FoundryPicker({
           }}
         >
           <ChevronDown size={15} />
-        </button>
-        <button
-          type="button"
-          className="icon-button"
-          aria-label="刷新 Foundry 列表"
-          title={`使用${identityLabel(config)}重新读取 Foundry、部署和诊断设置`}
-          disabled={discovery.listing}
-          onClick={() => void discovery.refresh()}
-        >
-          <RefreshCw size={15} className={discovery.listing ? "spin" : ""} />
         </button>
         {open && shown.length > 0 && (
           <ul id={`${id}-list`} role="listbox" className="combo-list">

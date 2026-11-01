@@ -1368,7 +1368,7 @@ def test_discovery_detail_resolves_workspaces_deployments_and_destinations():
     assert (shared.request_logs, shared.usage_logs, shared.dedicated) == (True, True, False)
     assert locked.workspace_id == "" and locked.name == "locked-logs"
     assert (locked.request_logs, locked.usage_logs, locked.dedicated) == (True, False, True)
-    assert "Reader" in locked.error and "secret" not in locked.error
+    assert "Log Analytics Reader" in locked.error and "secret" not in locked.error
     assert [(item.kind, item.name, item.setting) for item in detail.other_destinations] == [
         ("storage", "archive", "everything"),
         ("event_hub", "hub", "stream"),

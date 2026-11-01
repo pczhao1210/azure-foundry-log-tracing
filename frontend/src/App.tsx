@@ -260,7 +260,11 @@ export default function App() {
                 <p className="quiet">读取配置中…</p>
               ) : (
                 <>
-                  <FoundryPicker discovery={discovery} config={config} />
+                  <FoundryPicker
+                    discovery={discovery}
+                    config={config}
+                    onIdentity={(mode) => update("logs_auth_mode", mode)}
+                  />
                   <label>
                     Foundry Endpoint
                     <input
@@ -369,8 +373,9 @@ export default function App() {
                     </select>
                   </label>
                   <p className="hint">
-                    日志查询使用独立的 Entra 权限，不能使用模型 API Key。
-                    内置规则：日志 CorrelationId 等于响应头 apim-request-id。
+                    日志查询使用独立的 Entra 权限，不能使用模型 API Key；
+                    同时用于上方 Foundry 资源发现。 内置规则：日志 CorrelationId
+                    等于响应头 apim-request-id。
                   </p>
                   <label>
                     日志请求 ID 字段
