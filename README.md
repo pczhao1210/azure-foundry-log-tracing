@@ -32,13 +32,43 @@ uv sync --frozen
 npm ci --prefix frontend
 cp .env.example .env
 # 在 .env 中配置 Azure 资源与身份，不要提交 .env
+./start.sh
+```
+
+打开 <http://127.0.0.1:8000>。后端同时提供静态 UI 和 API。
+
+### start.sh
+
+[start.sh](start.sh) 是日常启动入口，在任意目录执行都可以：
+
+```bash
+./start.sh              # 重启：停掉遗留后端 → 按需构建前端 → 启动
+./start.sh new          # 全新启动：先清空 SQLite 数据库再启动（--new 等价）
+./start.sh --port 8010  # 换端口；--host 同理，默认 127.0.0.1:8000
+```
+
+- **遗留进程**：只停止“命令行含 `backend.app:create_app`、工作目录为本项目、正在监听目标端口”的进程。
+  先发 SIGTERM，`STOP_TIMEOUT`（默认 10 秒）内未退出再 SIGKILL。端口被其他程序占用，或无法识别占用者时
+  **不会强杀**，直接报错退出，请改用 `--port` 或自行处理。
+- **`new`**：删除 `DATABASE_PATH` 指向的数据库及其 `-wal`/`-shm`/`-journal` 文件，**实验历史无法恢复**；
+  数据库在启动时自动重建。清空发生在旧进程已停止、端口确认空闲之后，所以前端构建失败、
+  配置读取失败或端口无法释放时，数据库保持原样。
+- **前端**：`frontend/dist` 不存在或比源码旧时才构建（缺 `node_modules` 时先 `npm ci`）。
+  构建失败会取消启动，**不会**停掉正在运行的旧进程。
+- **范围**：只处理目标端口上的进程。要并行运行第二个实例，请同时指定不同的 `--port` 和 `DATABASE_PATH`；
+  否则后启动的实例会把先启动实例中进行中的请求标记为失败（启动时的中断恢复逻辑）。
+- 脚本在前台运行，Ctrl+C 停止。需要后台运行时用 `systemd`、tmux 等自行包装。
+
+不使用脚本时，手工等价命令是：
+
+```bash
 npm run build --prefix frontend
 uv run uvicorn backend.app:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
-打开 <http://127.0.0.1:8000>。先构建前端再启动后端；后端同时提供静态 UI 和 API。
+### 开发模式
 
-开发模式使用两个终端：
+开发模式（后端热重载、前端热更新）使用两个终端：
 
 ```bash
 uv run uvicorn backend.app:create_app --factory --host 127.0.0.1 --port 8000 --reload
@@ -249,6 +279,10 @@ npm run test:e2e --prefix frontend
 `requestTime` 解码、数组 token 字段和“等待两个日志类别”轮询；回查覆盖查询注入与时间窗口校验、
 本地实验标记、并发 429、错误脱敏、结果不落盘，以及多 Foundry 共用 Workspace（仅模拟数据）。
 **Mock 测试不证明真实 Azure 关联成功**；真实验收需要配置自己的资源、身份与诊断字段。
+
+`tests/test_start_script.py` 用假的 `uv`/`npm` 和本地监听进程验证 [start.sh](start.sh)：只停止本项目的后端、
+拒绝强杀其他程序、`new` 的清库范围与顺序、构建失败不影响旧进程（仅 Linux，需要 `ss`）。
+脚本的静态检查：`uvx --from shellcheck-py shellcheck start.sh`。
 
 主要代码：[Python API](backend/app.py)、[执行引擎](backend/engine.py)、
 [日志关联](backend/azure.py)、[React UI](frontend/src/App.tsx)、[时间轴](frontend/src/Timeline.tsx)、
