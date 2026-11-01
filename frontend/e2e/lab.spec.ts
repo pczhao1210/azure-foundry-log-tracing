@@ -275,7 +275,16 @@ async function fixtureApi(page: Page) {
     > | null;
     let data: unknown;
     if (path === "/api/config")
-      data = { ...connection, api_key_configured: true };
+      data = {
+        ...connection,
+        api_key_configured: true,
+        source: "env",
+        saved_at: null,
+        prompt: "",
+        max_completion_tokens: 256,
+        api: "chat_completions",
+        stream: false,
+      };
     else if (path === "/api/lookup/resources") data = lookupResources;
     else if (path === "/api/lookup/candidates") {
       lookupBodies.push({ path, body });

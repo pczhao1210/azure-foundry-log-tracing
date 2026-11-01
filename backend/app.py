@@ -91,8 +91,8 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
         return {"status": "ok"}
 
     @app.get("/api/config")
-    async def config():
-        return {
+    async def config(request: Request):
+        result = {
             "endpoint": settings.foundry_endpoint,
             "deployment": settings.foundry_deployment,
             "auth_mode": settings.llm_auth_mode,
@@ -103,7 +103,24 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
             "log_id_field": settings.log_id_field,
             "mapping_verified": settings.log_id_mapping_verified,
             "api_key_configured": bool(settings.foundry_api_key),
+            "source": "env",
+            "saved_at": None,
+            "prompt": "",
+            "max_completion_tokens": 256,
+            "api": "chat_completions",
+            "stream": False,
         }
+        saved = service(request).store.preferences()
+        if saved is not None:
+            # The last submitted call wins over .env until the user resets it.
+            result.update(saved.connection.model_dump())
+            result.update(saved.model_dump(exclude={"connection"}), source="saved")
+        return result
+
+    @app.post("/api/preferences/reset")
+    async def reset_preferences(request: Request):
+        service(request).store.clear_preferences()
+        return await config(request)
 
     @app.post("/api/check")
     async def check(body: Connection, request: Request):
@@ -125,6 +142,8 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
                 "status": run.status,
                 "deployment": run.connection.deployment,
                 "auth_mode": run.connection.auth_mode,
+                "api": run.api,
+                "stream": run.stream,
                 "log_state": run.logs.state,
             }
             for run in service(request).store.list()

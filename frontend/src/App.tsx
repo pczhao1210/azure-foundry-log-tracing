@@ -34,6 +34,8 @@ import { Badge, Json } from "./ui";
 import {
   accountMismatch,
   api,
+  apiLabels,
+  callMode,
   checkSchema,
   configSchema,
   connectionSchema,
@@ -41,19 +43,27 @@ import {
   historySchema,
   milliseconds,
   runSchema,
+  type ApiKind,
   type Check,
+  type Config,
   type Connection,
   type History,
   type Run,
 } from "./types";
 
+const DEFAULT_PROMPT = "请用一句话解释分布式系统中的请求关联。";
+const RESPONSES_MIN_TOKENS = 16;
+const apiKinds: ApiKind[] = ["chat_completions", "responses"];
+
 export default function App() {
   const [config, setConfig] = useState<Connection | null>(null);
   const [keyReady, setKeyReady] = useState(false);
-  const [prompt, setPrompt] = useState(
-    "请用一句话解释分布式系统中的请求关联。",
-  );
+  const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
   const [tokens, setTokens] = useState(256);
+  const [apiKind, setApiKind] = useState<ApiKind>("chat_completions");
+  const [stream, setStream] = useState(false);
+  // When set, the form was restored from the last submitted call instead of .env.
+  const [savedAt, setSavedAt] = useState<string | null>(null);
   const [run, setRun] = useState<Run | null>(null);
   const [history, setHistory] = useState<History>([]);
   const [check, setCheck] = useState<Check | null>(null);
@@ -70,13 +80,23 @@ export default function App() {
     [],
   );
 
+  function applyConfig(value: Config) {
+    setConfig(connectionSchema.parse(value));
+    setKeyReady(value.api_key_configured);
+    setPrompt(value.prompt || DEFAULT_PROMPT);
+    setTokens(value.max_completion_tokens);
+    setApiKind(value.api);
+    setStream(value.stream);
+    setSavedAt(value.source === "saved" ? value.saved_at : null);
+    setCheck(null);
+  }
+
   useEffect(() => {
     let current = true;
     Promise.all([api("/config", configSchema), api("/runs", historySchema)])
       .then(([value, items]) => {
         if (current) {
-          setConfig(connectionSchema.parse(value));
-          setKeyReady(value.api_key_configured);
+          applyConfig(value);
           setHistory(items);
         }
       })
@@ -155,9 +175,24 @@ export default function App() {
       const value = await api(`/runs/${id}`, runSchema);
       selectRun(value);
       setConfig(value.connection);
+      setTokens(value.max_completion_tokens);
+      setApiKind(value.api);
+      setStream(value.stream);
       setCheck(null);
       setMode("run");
     });
+  }
+
+  function chooseApi(value: ApiKind) {
+    setApiKind(value);
+    if (value === "responses")
+      setTokens((current) => Math.max(current, RESPONSES_MIN_TOKENS));
+  }
+
+  function resetDefaults() {
+    return action("reset", async () =>
+      applyConfig(await api("/preferences/reset", configSchema, {})),
+    );
   }
 
   function switchMode(value: "run" | "lookup") {
@@ -220,9 +255,9 @@ export default function App() {
               调用 Foundry，读取真实诊断日志，用请求 ID 验证链路，而不是猜测。
             </p>
           </div>
-          <div className="mode-pill">
+          <div className="mode-pill" aria-label="当前调用方式">
             <FlaskConical size={17} />
-            直连实验 · 非流式
+            直连实验 · {callMode(apiKind, stream)}
           </div>
         </div>
 
@@ -260,6 +295,22 @@ export default function App() {
                 <p className="quiet">读取配置中…</p>
               ) : (
                 <>
+                  {savedAt && (
+                    <div className="saved-note" role="status">
+                      <span>
+                        默认值来自上次调用
+                        <small>{new Date(savedAt).toLocaleString()}</small>
+                      </span>
+                      <button
+                        type="button"
+                        className="text-button"
+                        disabled={!!busy}
+                        onClick={() => void resetDefaults()}
+                      >
+                        恢复 .env 默认
+                      </button>
+                    </div>
+                  )}
                   <FoundryPicker
                     discovery={discovery}
                     config={config}
@@ -466,6 +517,9 @@ export default function App() {
                     >
                       <span>
                         <strong>{item.deployment}</strong>
+                        <small className="history-mode">
+                          {callMode(item.api, item.stream)}
+                        </small>
                         <small>
                           {new Date(item.created_at).toLocaleString()}
                         </small>
@@ -525,16 +579,60 @@ export default function App() {
                   rows={3}
                 />
                 <div className="request-actions">
-                  <label className="token-input">
-                    Max completion tokens
-                    <input
-                      type="number"
-                      min={1}
-                      max={4096}
-                      value={tokens}
-                      onChange={(e) => setTokens(Number(e.target.value))}
-                    />
-                  </label>
+                  <div className="request-options">
+                    <div
+                      className="request-option"
+                      role="group"
+                      aria-label="调用接口"
+                    >
+                      <span>接口</span>
+                      <div className="segmented mini">
+                        {apiKinds.map((value) => (
+                          <button
+                            key={value}
+                            type="button"
+                            aria-pressed={apiKind === value}
+                            className={apiKind === value ? "chosen" : ""}
+                            onClick={() => chooseApi(value)}
+                          >
+                            {apiLabels[value]}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div
+                      className="request-option"
+                      role="group"
+                      aria-label="输出方式"
+                    >
+                      <span>输出</span>
+                      <div className="segmented mini">
+                        {[false, true].map((value) => (
+                          <button
+                            key={String(value)}
+                            type="button"
+                            aria-pressed={stream === value}
+                            className={stream === value ? "chosen" : ""}
+                            onClick={() => setStream(value)}
+                          >
+                            {value ? "流式" : "非流式"}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <label className="token-input">
+                      {apiKind === "responses"
+                        ? "Max output tokens"
+                        : "Max completion tokens"}
+                      <input
+                        type="number"
+                        min={apiKind === "responses" ? RESPONSES_MIN_TOKENS : 1}
+                        max={4096}
+                        value={tokens}
+                        onChange={(e) => setTokens(Number(e.target.value))}
+                      />
+                    </label>
+                  </div>
                   <div className="actions">
                     {active && (
                       <button
@@ -559,15 +657,26 @@ export default function App() {
                     )}
                     <button
                       className="button primary"
-                      disabled={!config || !!busy || active || !prompt.trim()}
+                      disabled={
+                        !config ||
+                        !!busy ||
+                        active ||
+                        !prompt.trim() ||
+                        (apiKind === "responses" &&
+                          tokens < RESPONSES_MIN_TOKENS)
+                      }
                       onClick={() =>
                         action("run", async () => {
                           const value = await api("/runs", runSchema, {
                             connection: config,
                             prompt,
                             max_completion_tokens: tokens,
+                            api: apiKind,
+                            stream,
                           });
                           selectRun(value);
+                          // The server stores a submitted call as the next default.
+                          setSavedAt(value.created_at);
                           await refreshHistory();
                         })
                       }
@@ -577,6 +686,13 @@ export default function App() {
                     </button>
                   </div>
                 </div>
+                <p className="hint request-hint">
+                  {apiKind === "responses" &&
+                    "Responses 以 store:false 发送，Azure 不保留响应对象；输出上限至少 16。 "}
+                  {stream
+                    ? "流式：边接收边显示，并记录 Client 实测首 token 与流式解码 TPS。"
+                    : "非流式：读完整个响应体后一次性显示。"}
+                </p>
               </section>
 
               <div className="metrics">

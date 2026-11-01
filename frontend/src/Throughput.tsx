@@ -1,4 +1,10 @@
-import { formatTps, sourceLabels, tpsBases, type TpsInput } from "./metrics";
+import {
+  formatTps,
+  reasoningTokens,
+  sourceLabels,
+  tpsBases,
+  type TpsInput,
+} from "./metrics";
 import { milliseconds } from "./types";
 
 export function ThroughputBreakdown({ run }: { run: TpsInput | null }) {
@@ -6,11 +12,9 @@ export function ThroughputBreakdown({ run }: { run: TpsInput | null }) {
   const bases = tpsBases(run);
   const max = Math.max(1, ...bases.map((item) => item.value ?? 0));
   const available = bases.filter((item) => item.value !== null).length;
-  const details = run.usage.completion_tokens_details;
-  const reasoning =
-    typeof details === "object" && details !== null
-      ? (details as Record<string, unknown>).reasoning_tokens
-      : undefined;
+  const reasoning = reasoningTokens(run.usage);
+  const streamed =
+    bases.find((item) => item.key === "client_stream")?.value != null;
   return (
     <section
       className="timeline-section throughput-section"
@@ -70,8 +74,10 @@ export function ThroughputBreakdown({ run }: { run: TpsInput | null }) {
       <p className="legend">
         {run.external
           ? "回查调用只有 Azure 日志口径；completionTokens 含 reasoning tokens。"
-          : `completion_tokens 含 reasoning tokens（本次 ${typeof reasoning === "number" ? reasoning : "—"}）。`}
+          : `输出 token 含 reasoning tokens（本次 ${reasoning ?? "—"}）。`}
         分母越接近模型生成阶段，TPS 越高；各口径不可互相替代。
+        {streamed &&
+          " Azure 默认内容过滤会缓冲流式输出并分块返回，流式解码 TPS 反映的是到达速率，可能偏高。"}
       </p>
     </section>
   );

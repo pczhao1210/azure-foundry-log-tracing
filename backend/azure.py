@@ -777,7 +777,7 @@ def response_meta(headers: dict[str, str], body: dict[str, JsonValue]) -> dict[s
         for name in META_HEADERS
         if name in headers and re.fullmatch(r"[\w .:/-]{1,200}", headers[name])
     }
-    for key in ("id", "model", "system_fingerprint"):
+    for key in ("id", "model", "system_fingerprint", "status"):
         value = body.get(key)
         if isinstance(value, str) and re.fullmatch(r"[\w.:-]{1,200}", value):
             meta[f"response.{key}"] = value
@@ -876,9 +876,12 @@ def log_events(records: list[LogRecord], created_at: str | None = None) -> list[
         if last is not None and last - first >= 1:
             phases.append(("Azure usage log: time to last token", last))
         elif last is not None and abs(last - first) < 1:
-            # Non-streaming calls report TTFT == TTLT; the value marks full output, not first token.
+            # Non-streaming Chat Completions report TTFT == TTLT; the value marks full output.
             phases = [("Azure usage log: full output (TTFT = TTLT)", first)]
-            note = "非流式调用中 TTFT 与 TTLT 相同，表示完整输出耗时，不是真实首 token；"
+            note = (
+                "TTFT 与 TTLT 相同（非流式 Chat Completions 的表现），"
+                "表示完整输出耗时，不是真实首 token；"
+            )
         for title, duration in phases:
             events.append(
                 Event(

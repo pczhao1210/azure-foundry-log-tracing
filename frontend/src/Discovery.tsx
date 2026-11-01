@@ -46,6 +46,30 @@ function same(a: string, b: string): boolean {
   return a.toLowerCase() === b.toLowerCase();
 }
 
+const STALE_MS = 24 * 60 * 60 * 1000;
+
+// Describe a result served from the SQLite cache; empty for a fresh Azure read.
+export function cacheNote(
+  value: { cached: boolean; checked_at: string | null; refresh_error: string },
+  now = Date.now(),
+): { text: string; warn: boolean } {
+  if (!value.cached) return { text: "", warn: false };
+  const time = value.checked_at ? Date.parse(value.checked_at) : NaN;
+  let text = Number.isNaN(time)
+    ? "来自本地缓存"
+    : `缓存于 ${new Date(time).toLocaleString()}`;
+  if (value.refresh_error)
+    return {
+      text: `${text}；刷新失败，继续显示缓存：${value.refresh_error}`,
+      warn: true,
+    };
+  const stale = !Number.isNaN(time) && now - time > STALE_MS;
+  text += stale
+    ? "，已超过 24 小时，建议点击「刷新」"
+    : "，点击「刷新」重新读取";
+  return { text, warn: stale };
+}
+
 function failure(err: unknown): string {
   const text = String(err);
   return text.includes("HTTP 422")
@@ -90,9 +114,11 @@ export function useFoundryDiscovery(config: Connection | null, change: Change) {
   const listRequest = useRef<AbortController | null>(null);
   const detailRequest = useRef<AbortController | null>(null);
   const detailKey = useRef("");
+  // Set by a manual refresh so the following detail read also bypasses the cache.
+  const forceDetail = useRef(false);
   latest.current = config;
 
-  async function refresh() {
+  async function refresh(force = false) {
     const current = latest.current;
     if (!current) return;
     listRequest.current?.abort();
@@ -105,7 +131,7 @@ export function useFoundryDiscovery(config: Connection | null, change: Change) {
         await api(
           "/discovery/foundries",
           foundriesSchema,
-          identityBody(current),
+          { ...identityBody(current), refresh: force },
           controller.signal,
         ),
       );
@@ -113,6 +139,7 @@ export function useFoundryDiscovery(config: Connection | null, change: Change) {
       setSourceKey(identityKey(current));
       // A manual refresh also re-reads deployments and diagnostic settings.
       detailKey.current = "";
+      forceDetail.current = force;
     } catch (err: unknown) {
       if (!controller.signal.aborted) setListError(failure(err));
     } finally {
@@ -127,13 +154,15 @@ export function useFoundryDiscovery(config: Connection | null, change: Change) {
     const controller = new AbortController();
     detailRequest.current = controller;
     detailKey.current = resourceId.toLowerCase();
+    const force = forceDetail.current;
+    forceDetail.current = false;
     setLoading(resourceId);
     setDetailError("");
     try {
       const value = await api(
         "/discovery/foundry",
         foundryDetailSchema,
-        { ...identityBody(current), resource_id: resourceId },
+        { ...identityBody(current), resource_id: resourceId, refresh: force },
         controller.signal,
       );
       setDetail(value);
@@ -284,6 +313,11 @@ export function FoundryPicker({
     ? `${discovery.source}：${discovery.list.message}`
     : "";
   let listWarn = discovery.list?.state === "error";
+  if (discovery.list) {
+    const note = cacheNote(discovery.list);
+    if (note.text) listStatus += `（${note.text}）`;
+    listWarn ||= note.warn;
+  }
   if (discovery.listing)
     listStatus = `正在通过${identityLabel(config)}发现可访问的 Foundry…`;
   else if (discovery.listError) {
@@ -312,6 +346,9 @@ export function FoundryPicker({
       detailStatus += ` · ${detail.message}`;
       detailWarn = true;
     }
+    const note = cacheNote(detail);
+    if (note.text) detailStatus += `（${note.text}）`;
+    detailWarn ||= note.warn;
   }
 
   return (
@@ -342,7 +379,7 @@ export function FoundryPicker({
             aria-label="刷新 Foundry 列表"
             title={`使用${identityLabel(config)}重新读取 Foundry、部署和诊断设置`}
             disabled={discovery.listing}
-            onClick={() => void discovery.refresh()}
+            onClick={() => void discovery.refresh(true)}
           >
             <RefreshCw size={13} className={discovery.listing ? "spin" : ""} />
             刷新

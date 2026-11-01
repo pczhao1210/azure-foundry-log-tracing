@@ -13,7 +13,7 @@ import { LogDiscovery } from "./LogDiscovery";
 import { ThroughputBreakdown } from "./Throughput";
 import { RunRawLogs } from "./RawLogs";
 import { formatTps, tokenCount, tpsBases } from "./metrics";
-import { applyDetail, LogTargets } from "./Discovery";
+import { applyDetail, cacheNote, LogTargets } from "./Discovery";
 import {
   accountMismatch,
   api,
@@ -330,7 +330,22 @@ const trace = traceSchema.parse({
   raw_end: "2026-11-01T04:15:00Z",
 });
 
-function mockApi() {
+const envConfig = {
+  ...connection,
+  api_key_configured: true,
+  source: "env",
+  saved_at: null,
+  prompt: "",
+  max_completion_tokens: 256,
+  api: "chat_completions",
+  stream: false,
+};
+
+function mockApi({
+  config = envConfig as Record<string, unknown>,
+  history = [] as unknown[],
+  list = foundries as unknown,
+} = {}) {
   const calls: { url: string; body: unknown }[] = [];
   vi.stubGlobal(
     "fetch",
@@ -339,9 +354,9 @@ function mockApi() {
         typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
       calls.push({ url: input, body });
       let payload: unknown;
-      if (input === "/api/config")
-        payload = { ...connection, api_key_configured: true };
-      else if (input === "/api/runs" && !init?.method) payload = [];
+      if (input === "/api/config") payload = config;
+      else if (input === "/api/preferences/reset") payload = envConfig;
+      else if (input === "/api/runs" && !init?.method) payload = history;
       else if (input === "/api/runs" && init?.method === "POST") payload = run;
       else if (input === `/api/runs/${run.id}` && !init?.method) payload = run;
       else if (input === `/api/runs/${run.id}/query`) payload = run;
@@ -349,7 +364,7 @@ function mockApi() {
       else if (input === "/api/lookup/resources") payload = lookupResources;
       else if (input === "/api/lookup/candidates") payload = candidates;
       else if (input === "/api/lookup/raw-logs") payload = rawLogs;
-      else if (input === "/api/discovery/foundries") payload = foundries;
+      else if (input === "/api/discovery/foundries") payload = list;
       else if (input === "/api/discovery/foundry")
         payload = foundryDetail((body as { resource_id: string }).resource_id);
       else if (input === "/api/lookup/trace") {
@@ -493,6 +508,114 @@ describe("request lab", () => {
     );
     await expect(api("/runs", runSchema)).rejects.toThrow();
   });
+
+  const pressed = (group: string, name: string) =>
+    within(screen.getByRole("group", { name: group }))
+      .getByRole("button", { name })
+      .getAttribute("aria-pressed");
+
+  it("submits the chosen API and streaming mode", async () => {
+    const calls = mockApi({
+      history: [
+        {
+          id: run.id,
+          created_at: run.created_at,
+          status: "succeeded",
+          deployment: "test-deployment",
+          auth_mode: "api_key",
+          api: "responses",
+          stream: true,
+          log_state: "matched",
+        },
+      ],
+    });
+    render(<App />);
+    await screen.findByText("API Key 已在服务端配置，不会返回浏览器。");
+    expect(screen.getByLabelText("当前调用方式").textContent).toContain(
+      "Chat Completions · 非流式",
+    );
+    expect(pressed("调用接口", "Chat Completions")).toBe("true");
+    expect(pressed("输出方式", "非流式")).toBe("true");
+    expect(
+      screen.getByRole("button", { name: /test-deployment/ }).textContent,
+    ).toContain("Responses · 流式");
+    const tokens = screen.getByLabelText("Max completion tokens");
+    fireEvent.change(tokens, { target: { value: "8" } });
+    fireEvent.click(screen.getByRole("button", { name: "Responses" }));
+    // Switching to Responses raises the limit to the API minimum of 16.
+    expect(screen.getByLabelText("Max output tokens")).toHaveProperty(
+      "value",
+      "16",
+    );
+    fireEvent.change(screen.getByLabelText("Max output tokens"), {
+      target: { value: "15" },
+    });
+    expect(
+      screen.getByRole("button", { name: "执行请求" }).hasAttribute("disabled"),
+    ).toBe(true);
+    fireEvent.change(screen.getByLabelText("Max output tokens"), {
+      target: { value: "32" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "流式" }));
+    expect(screen.getByLabelText("当前调用方式").textContent).toContain(
+      "Responses · 流式",
+    );
+    expect(screen.getByText(/store:false/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "执行请求" }));
+    await screen.findByText("azure-123");
+    expect(
+      calls.find((call) => call.url === "/api/runs" && call.body)?.body,
+    ).toMatchObject({
+      api: "responses",
+      stream: true,
+      max_completion_tokens: 32,
+    });
+    // The submitted call is now the saved default.
+    expect(screen.getByText("默认值来自上次调用")).toBeTruthy();
+  });
+
+  it("restores the last submitted call and resets to .env defaults", async () => {
+    const calls = mockApi({
+      config: {
+        ...envConfig,
+        deployment: "picked-model",
+        source: "saved",
+        saved_at: "2026-11-01T04:00:00Z",
+        prompt: "上次的 Prompt",
+        max_completion_tokens: 64,
+        api: "responses",
+        stream: true,
+      },
+    });
+    render(<App />);
+    await screen.findByText("默认值来自上次调用");
+    expect(screen.getByLabelText("Prompt")).toHaveProperty(
+      "value",
+      "上次的 Prompt",
+    );
+    expect(screen.getByLabelText("Max output tokens")).toHaveProperty(
+      "value",
+      "64",
+    );
+    expect(pressed("调用接口", "Responses")).toBe("true");
+    expect(pressed("输出方式", "流式")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "恢复 .env 默认" }));
+    await waitFor(() =>
+      expect(screen.queryByText("默认值来自上次调用")).toBeNull(),
+    );
+    expect(
+      calls.find((call) => call.url === "/api/preferences/reset")?.body,
+    ).toEqual({});
+    expect(screen.getByLabelText("Prompt")).toHaveProperty(
+      "value",
+      "请用一句话解释分布式系统中的请求关联。",
+    );
+    expect(pressed("调用接口", "Chat Completions")).toBe("true");
+    expect(pressed("输出方式", "非流式")).toBe("true");
+    expect(calls.some((call) => call.url === "/api/runs" && call.body)).toBe(
+      false,
+    );
+  });
 });
 
 describe("timeline evidence", () => {
@@ -624,6 +747,7 @@ describe("throughput", () => {
     expect(values).toEqual({
       client_total: "24.9 tok/s",
       client_http: "30.6 tok/s",
+      client_stream: "—",
       azure_request: "62.7 tok/s",
       azure_usage: "65.2 tok/s",
       decode: "234.1 tok/s",
@@ -660,10 +784,55 @@ describe("throughput", () => {
     ).toBe("未关联到 AzureOpenAIRequestUsage 日志");
   });
 
+  it("measures streaming decode from content deltas without reasoning tokens", () => {
+    const streamed = runSchema.parse({
+      ...run,
+      api: "responses",
+      stream: true,
+      duration_ms: 2000,
+      usage: {
+        output_tokens: 30,
+        output_tokens_details: { reasoning_tokens: 10 },
+      },
+      events: [
+        { ...event, id: "wait", title: "HTTP request / waiting for headers" },
+        {
+          ...event,
+          id: "stream",
+          title: "Receiving stream",
+          duration_ms: 500,
+          details: { first_delta_after_ms: 100, last_delta_after_ms: 480 },
+        },
+      ],
+    });
+    const bases = Object.fromEntries(
+      tpsBases(streamed).map((item) => [item.key, item]),
+    );
+    // (30 − 10 − 1) visible tokens after the first delta over 380 ms.
+    expect(formatTps(bases.client_stream.value)).toBe("50.0 tok/s");
+    expect(formatTps(bases.client_total.value)).toBe("15.0 tok/s");
+    expect(formatTps(bases.client_http.value)).toBe("54.5 tok/s");
+    const single = runSchema.parse({
+      ...streamed,
+      usage: { output_tokens: 1 },
+    });
+    expect(
+      tpsBases(single).find((item) => item.key === "client_stream")?.missing,
+    ).toBe("内容增量不足以计算解码速率");
+    render(<ThroughputBreakdown run={streamed} />);
+    expect(
+      screen.getByRole("region", { name: "TPS 对比" }).textContent,
+    ).toContain("reasoning tokens（本次 10）");
+    expect(
+      screen.getByRole("region", { name: "TPS 对比" }).textContent,
+    ).toContain("内容过滤会缓冲流式输出");
+  });
+
   it("renders the comparison with sources and formulas", () => {
     render(<ThroughputBreakdown run={measured} />);
     const section = screen.getByRole("region", { name: "TPS 对比" });
-    expect(section.textContent).toContain("5/5 个口径可计算");
+    expect(section.textContent).toContain("5/6 个口径可计算");
+    expect(section.textContent).toContain("仅流式调用可测");
     expect(section.textContent).toContain("Azure 日志 · 49 tok ÷ 782.0 ms");
     expect(section.textContent).toContain("234.1 tok/s");
     expect(section.textContent).toContain("reasoning tokens（本次 0）");
@@ -735,7 +904,12 @@ describe("historical lookup", () => {
     );
     expect(formatTps(bases.azure_request.value)).toBe("62.7 tok/s");
     expect(formatTps(bases.azure_usage.value)).toBe("65.2 tok/s");
-    for (const key of ["client_total", "client_http", "decode"])
+    for (const key of [
+      "client_total",
+      "client_http",
+      "client_stream",
+      "decode",
+    ])
       expect(bases[key].missing).toBe("回查仅含 Azure 日志，无客户端数据");
   });
 
@@ -1037,7 +1211,11 @@ describe("foundry discovery", () => {
     expect(picker).toHaveProperty("value", "example");
     expect(
       calls.find((call) => call.url === "/api/discovery/foundries")?.body,
-    ).toEqual({ logs_auth_mode: "azure_cli", managed_identity_client_id: "" });
+    ).toEqual({
+      logs_auth_mode: "azure_cli",
+      managed_identity_client_id: "",
+      refresh: false,
+    });
     expect(screen.getByLabelText(/^Deployment/)).toHaveProperty(
       "value",
       "test-deployment",
@@ -1074,6 +1252,7 @@ describe("foundry discovery", () => {
       logs_auth_mode: "azure_cli",
       managed_identity_client_id: "",
       resource_id: `${accountPrefix}japan-lab`,
+      refresh: false,
     });
     expect(
       calls.some((call) => call.url.startsWith("/api/runs") && call.body),
@@ -1116,6 +1295,7 @@ describe("foundry discovery", () => {
     expect(listCalls()[1].body).toEqual({
       logs_auth_mode: "managed_identity",
       managed_identity_client_id: "",
+      refresh: false,
     });
     expect(screen.getByLabelText(/^日志查询身份/)).toHaveProperty(
       "value",
@@ -1133,8 +1313,60 @@ describe("foundry discovery", () => {
     expect(listCalls().at(-1)?.body).toEqual({
       logs_auth_mode: "managed_identity",
       managed_identity_client_id: clientId,
+      refresh: true,
     });
     expect(screen.queryByText(/身份参数已修改/)).toBeNull();
+  });
+
+  it("explains cached discovery results and bypasses the cache on 刷新", async () => {
+    const calls = mockApi({
+      list: {
+        ...foundries,
+        cached: true,
+        refresh_error: "Azure CLI 未登录",
+      },
+    });
+    render(<App />);
+    await screen.findByText(/刷新失败，继续显示缓存：Azure CLI 未登录/);
+    await waitFor(() =>
+      expect(
+        calls.filter((call) => call.url === "/api/discovery/foundry"),
+      ).toHaveLength(1),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "刷新 Foundry 列表" }));
+    await waitFor(() =>
+      expect(
+        calls.filter((call) => call.url === "/api/discovery/foundry"),
+      ).toHaveLength(2),
+    );
+    const bodies = (url: string) =>
+      calls
+        .filter((call) => call.url === url)
+        .map((call) => (call.body as { refresh: boolean }).refresh);
+    expect(bodies("/api/discovery/foundries")).toEqual([false, true]);
+    expect(bodies("/api/discovery/foundry")).toEqual([false, true]);
+  });
+
+  it("describes cache age and refresh failures", () => {
+    const checked = "2026-11-01T04:00:00Z";
+    const at = Date.parse(checked);
+    const value = { cached: true, checked_at: checked, refresh_error: "" };
+    expect(cacheNote({ ...value, cached: false })).toEqual({
+      text: "",
+      warn: false,
+    });
+    const fresh = cacheNote(value, at + 60_000);
+    expect(fresh.warn).toBe(false);
+    expect(fresh.text).toMatch(/^缓存于 .*，点击「刷新」重新读取$/);
+    const stale = cacheNote(value, at + 25 * 60 * 60 * 1000);
+    expect(stale.warn).toBe(true);
+    expect(stale.text).toContain("已超过 24 小时");
+    expect(
+      cacheNote({ ...value, refresh_error: "HTTP 403" }, at).text,
+    ).toContain("刷新失败，继续显示缓存：HTTP 403");
+    expect(cacheNote({ ...value, checked_at: null }).text).toBe(
+      "来自本地缓存，点击「刷新」重新读取",
+    );
   });
 
   it("keeps valid choices and flags a workspace outside the diagnostic targets", () => {

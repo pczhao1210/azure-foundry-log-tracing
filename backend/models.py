@@ -116,10 +116,33 @@ class Connection(BaseModel):
         return endpoint, resource
 
 
+ApiKind = Literal["chat_completions", "responses"]
+# The Responses API rejects max_output_tokens below this value.
+RESPONSES_MIN_TOKENS = 16
+
+
 class NewRun(BaseModel):
     connection: Connection
     prompt: str = Field(min_length=1, max_length=32000)
     max_completion_tokens: int = Field(default=256, ge=1, le=4096)
+    api: ApiKind = "chat_completions"
+    stream: bool = False
+
+    @model_validator(mode="after")
+    def responses_minimum(self) -> "NewRun":
+        if self.api == "responses" and self.max_completion_tokens < RESPONSES_MIN_TOKENS:
+            raise ValueError(f"The Responses API requires at least {RESPONSES_MIN_TOKENS} tokens.")
+        return self
+
+
+class Preferences(BaseModel):
+    # Defaults captured from the last submitted model call; never contains secrets.
+    connection: Connection
+    prompt: str = Field(default="", max_length=32000)
+    max_completion_tokens: int = Field(default=256, ge=1, le=4096)
+    api: ApiKind = "chat_completions"
+    stream: bool = False
+    saved_at: str = Field(default_factory=now)
 
 
 class QueryMapping(BaseModel):
@@ -198,6 +221,8 @@ class Run(BaseModel):
     status: Literal["queued", "running", "succeeded", "failed", "cancelled"] = "queued"
     connection: Connection
     max_completion_tokens: int
+    api: ApiKind = "chat_completions"
+    stream: bool = False
     http_status: int | None = None
     request_ids: dict[str, str] = Field(default_factory=dict)
     response_meta: dict[str, JsonValue] = Field(default_factory=dict)
@@ -344,11 +369,19 @@ class DiscoveryBase(BaseModel):
     # Discovery reuses the log-query identity; it only reads Azure Resource Manager.
     logs_auth_mode: Literal["managed_identity", "azure_cli"] = "managed_identity"
     managed_identity_client_id: str = ""
+    # False serves the last successful result from SQLite when one exists.
+    refresh: bool = False
 
     @field_validator("managed_identity_client_id")
     @classmethod
     def client_id(cls, value: str) -> str:
         return Connection.optional_uuid(value)
+
+    def identity_key(self) -> str:
+        client = (
+            self.managed_identity_client_id if self.logs_auth_mode == "managed_identity" else ""
+        )
+        return f"{self.logs_auth_mode}:{client.lower()}"
 
 
 class FoundryQuery(DiscoveryBase):
@@ -380,6 +413,10 @@ class Foundries(BaseModel):
     checked_at: str | None = None
     items: list[FoundrySummary] = Field(default_factory=list)
     limited: bool = False
+    # Set when served from SQLite; checked_at is then the time of the original read.
+    cached: bool = False
+    # A failed refresh that fell back to the cache keeps the failure message here.
+    refresh_error: str = ""
 
 
 class FoundryDeployment(BaseModel):
@@ -427,3 +464,5 @@ class FoundryDetail(BaseModel):
     workspaces: list[LogTarget] = Field(default_factory=list)
     other_destinations: list[OtherDestination] = Field(default_factory=list)
     diagnostics_error: str = ""
+    cached: bool = False
+    refresh_error: str = ""

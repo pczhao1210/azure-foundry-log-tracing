@@ -12,8 +12,15 @@ export const connectionSchema = z.object({
   log_id_field: z.string(),
   mapping_verified: z.boolean(),
 });
+export const apiKindSchema = z.enum(["chat_completions", "responses"]);
 export const configSchema = connectionSchema.extend({
   api_key_configured: z.boolean(),
+  source: z.enum(["env", "saved"]),
+  saved_at: z.string().nullable(),
+  prompt: z.string(),
+  max_completion_tokens: z.number(),
+  api: apiKindSchema,
+  stream: z.boolean(),
 });
 export const eventSchema = z.object({
   id: z.string(),
@@ -66,6 +73,9 @@ export const runSchema = z.object({
   status: z.enum(["queued", "running", "succeeded", "failed", "cancelled"]),
   connection: connectionSchema,
   max_completion_tokens: z.number(),
+  // Records written before the API/stream switch existed default to the old behavior.
+  api: apiKindSchema.default("chat_completions"),
+  stream: z.boolean().default(false),
   http_status: z.number().nullable(),
   request_ids: z.record(z.string(), z.string()),
   response_meta: jsonObject,
@@ -82,6 +92,8 @@ export const historySchema = z.array(
     status: runSchema.shape.status,
     deployment: z.string(),
     auth_mode: connectionSchema.shape.auth_mode,
+    api: apiKindSchema.default("chat_completions"),
+    stream: z.boolean().default(false),
     log_state: logSchema.shape.state,
   }),
 );
@@ -161,6 +173,8 @@ export const traceSchema = z.object({
   raw_end: z.string().nullable(),
 });
 export type Connection = z.infer<typeof connectionSchema>;
+export type Config = z.infer<typeof configSchema>;
+export type ApiKind = z.infer<typeof apiKindSchema>;
 export type Run = z.infer<typeof runSchema>;
 export type LogResult = z.infer<typeof logSchema>;
 export type TimelineEvent = z.infer<typeof eventSchema>;
@@ -189,6 +203,8 @@ export const foundriesSchema = z.object({
     }),
   ),
   limited: z.boolean(),
+  cached: z.boolean().default(false),
+  refresh_error: z.string().default(""),
 });
 export const foundryDetailSchema = z.object({
   state: z.enum(["ok", "partial", "error"]),
@@ -233,12 +249,23 @@ export const foundryDetailSchema = z.object({
     }),
   ),
   diagnostics_error: z.string(),
+  cached: z.boolean().default(false),
+  refresh_error: z.string().default(""),
 });
 export type Foundries = z.infer<typeof foundriesSchema>;
 export type Foundry = Foundries["items"][number];
 export type FoundryDetail = z.infer<typeof foundryDetailSchema>;
 export type Deployment = FoundryDetail["deployments"][number];
 export type LogTarget = FoundryDetail["workspaces"][number];
+
+export const apiLabels: Record<ApiKind, string> = {
+  chat_completions: "Chat Completions",
+  responses: "Responses",
+};
+
+export function callMode(api: ApiKind, stream: boolean): string {
+  return `${apiLabels[api]} · ${stream ? "流式" : "非流式"}`;
+}
 
 export const labels: Record<string, string> = {
   queued: "排队中",
@@ -322,6 +349,8 @@ export function eventName(title: string): string {
         "HTTP request / waiting for headers": "HTTP 请求 · 等待响应头",
         "Response headers received": "收到响应头",
         "Reading non-streaming response body": "读取非流式响应体",
+        "Receiving stream": "接收流式响应",
+        "First content delta": "首个内容增量（Client 实测首 token）",
         "Parsing response": "解析回答与用量",
         "Waiting before next log query": "等待下一次日志查询",
         "Read-only Log Analytics query": "查询 Log Analytics",

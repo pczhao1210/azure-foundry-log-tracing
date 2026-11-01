@@ -3,25 +3,49 @@
 Python/FastAPI + React/TypeScript 的单用户实验应用。先验证 **Client → Foundry**
 调用的原生响应请求 ID 能否与现有 Log Analytics 诊断记录关联。
 
-Client 指本应用后端；浏览器不持有 Azure Key 或 Token。首版仅支持 Azure 公有云
-Azure OpenAI-compatible `/openai/v1/chat/completions`、非流式调用。
-LiteLLM Gateway 路径、流式调用、内部模型调度追踪不在本版范围。
+Client 指本应用后端；浏览器不持有 Azure Key 或 Token。仅支持 Azure 公有云
+Azure OpenAI-compatible `/openai/v1/chat/completions` 与 `/openai/v1/responses`，
+可选流式或非流式（单轮文本输入）。LiteLLM Gateway 路径、工具调用/多轮对话、内部模型调度追踪不在本版范围。
 
 ## 真实环境验证结论（2026-11-01，East US 2，gpt-5.4-nano，MI）
 
 | 证据 | 结果 |
 |---|---|
-| 关联键 | `AzureDiagnostics.CorrelationId` **等于**响应头 `apim-request-id` |
-| 匹配的日志类别 | `RequestResponse`（`chatcompletions_create`）与 `AzureOpenAIRequestUsage`（`completion`）共用同一个 `CorrelationId` |
+| 关联键 | `AzureDiagnostics.CorrelationId` **等于**响应头 `apim-request-id`；Chat/Responses × 流式/非流式四种组合均精确匹配 |
+| 匹配的日志类别 | `RequestResponse`（Chat：`chatcompletions_create`；Responses：`create-response`）与 `AzureOpenAIRequestUsage`（Chat：`completion`；Responses：`responses`）共用同一个 `CorrelationId` |
 | 不进入日志 | `x-request-id`、客户端发送的 `x-ms-client-request-id`（仅在响应中回显） |
 | 服务端区间 | `RequestResponse.properties.requestTime`（100ns 时间单位）+ `DurationMs` |
-| 模型阶段 | `AzureOpenAIRequestUsage.properties.timeToFirstTokenMs` / `timeToLastTokenMs`；非流式调用两者相同，表示完整输出耗时，UI 标为“模型完整输出（TTFT = TTLT）” |
-| 用量 | `promptTokens`、`generatedTokens`、`cachedTokens`（数组形式）、部署名、模型版本、`streamType` |
+| 模型阶段 | `AzureOpenAIRequestUsage.properties.timeToFirstTokenMs` / `timeToLastTokenMs`；非流式 Chat Completions 两者相同，表示完整输出耗时，UI 标为“模型完整输出（TTFT = TTLT）”；流式调用与非流式 Responses 两者不同 |
+| 用量 | `promptTokens`、`generatedTokens`、`cachedTokens`（数组形式）、部署名、模型版本、`streamType`（`Streaming` / `Non-Streaming`，与请求一致） |
+| 流式到达 | 默认内容过滤下，Chat 流 47 个内容增量在约 19 ms 内集中到达（同一请求用量日志 TTFT→TTLT 约 380 ms），即缓冲后分块返回；Responses 流 29 个增量分布在约 300 ms |
 | 入库延迟 | `ingestion_time()` 观测到约 50–110 秒（相对请求开始）；两个类别到达时间不同 |
-| 响应体自带阶段 | `usage.latency_checkpoint`（`pre_inference_ms`、`engine_ttft_ms`、`service_ttft_ms` 等，仅相对值） |
+| 响应体自带阶段 | `usage.latency_checkpoint`（`pre_inference_ms`、`engine_ttft_ms`、`service_ttft_ms` 等，仅相对值）；只有非流式 Chat Completions 返回，流式与 Responses 均没有 |
 
 因此无需 OpenTelemetry 或自定义日志即可做到**请求级**精确关联。`CorrelationId ↔ apim-request-id`
 已作为内置规则直接判定为“精确匹配”；其他字段/响应头的相等仍只算“候选”，需要人工确认。
+
+### 四种调用的逐条验收证据
+
+2026-11-01 13:51–13:54 UTC 复验：East US 2 / `gpt-5.4-nano`，模型使用 MI，
+发现与日志查询使用 Azure CLI 身份。通过应用 API 发出真实 Azure 请求，没有模拟 Azure 传输；
+使用隔离临时 SQLite，不覆盖日常应用的默认配置与历史。
+测试 Prompt 为 `Reply with exactly the single word VERIFIED.`。
+
+| 组合 | HTTP / 回答 | 响应头 `apim-request-id` | 两类 Azure 日志中的 `CorrelationId` |
+|---|---|---|---|
+| Chat Completions · 非流式 | 200 / `VERIFIED` | `72f3a612-4474-4e0a-a0c6-7d141af1902f` | `72f3a612-4474-4e0a-a0c6-7d141af1902f` |
+| Chat Completions · 流式 | 200 / `VERIFIED` | `fb30644c-f863-46e6-9e72-6d5b5c218d5b` | `fb30644c-f863-46e6-9e72-6d5b5c218d5b` |
+| Responses · 非流式 | 200 / `VERIFIED` | `2e84df86-60a8-4221-ab62-37e70b801b80` | `2e84df86-60a8-4221-ab62-37e70b801b80` |
+| Responses · 流式 | 200 / `VERIFIED` | `de7fce87-5eee-4e98-888b-048d7e4870be` | `de7fce87-5eee-4e98-888b-048d7e4870be` |
+
+每行均重新查询 Azure 原始日志，分别核对 `RequestResponse` 和 `AzureOpenAIRequestUsage` 的
+`CorrelationId`，不是仅检查应用的 `matched` 状态。两类日志的 `streamType` 均与请求一致；
+Responses 出站请求的 `store` 均为 `false`，Chat 流式的 `stream_options.include_usage` 为 `true`。
+这些是该资源上的观测样本，不代表所有部署或 API 版本的保证。
+
+同轮验证确认：列表与资源详情刷新覆盖原缓存（各一行），四次提交后默认配置仍只有一行；
+重建应用实例后缓存、完整默认配置和请求/日志元数据仍在，回答为 `null`、不落盘；
+「恢复 .env 默认」可清除已保存配置。
 
 ## 快速启动
 
@@ -83,6 +107,13 @@ npm run dev --prefix frontend
 Endpoint、Deployment、身份模式和日志关联参数也可以在界面中编辑，每次执行保存配置快照。
 Key 只从后端环境读取，不提供浏览器输入/读取密钥的接口。
 
+**上次调用即默认值**：每次点击「执行请求」（仅正式提交，编辑表单不算）都会把连接配置（Foundry、
+Deployment、身份、Workspace 等）、Prompt、输出上限、调用接口和流式开关写入 SQLite `preferences` 表，
+覆盖上一条；下次打开页面优先使用它，配置卡顶部显示“默认值来自上次调用”和保存时间。
+点击「恢复 .env 默认」删除该记录，回到 `.env` 的值。保存的值完整覆盖 `.env` 连接配置，
+因此修改 `.env` 后需要先恢复默认才会生效；记录无法解析（例如升级后字段不兼容）时回退到 `.env`，
+并记录不含配置内容的服务端警告。
+
 | 配置 | 说明 |
 |---|---|
 | `FOUNDRY_ENDPOINT` | Azure 资源根 URL，或以 `/openai/v1` 结尾的 URL，不是 Foundry 项目/Agent URL |
@@ -123,6 +154,11 @@ Key 只从后端环境读取，不提供浏览器输入/读取密钥的接口。
 - 名称右侧的「Azure CLI / MI」开关切换发现身份，它与下方「日志查询身份」是同一设置；
   页面加载和切换身份时自动发现，「刷新」按钮重新读取列表、部署和诊断设置。
   修改 MI Client ID 后不会自动刷新，状态行会提示点击「刷新」。
+- **本地缓存**：资源列表和每个 Foundry 的部署/诊断设置按发现身份缓存在 SQLite `discovery_cache` 表。
+  页面加载、切换身份、选择资源时优先读取缓存（状态行注明“缓存于 …”，超过 24 小时提示刷新）；
+  未命中缓存时读取 Azure；已有缓存时只有「刷新」会重新访问 Azure，成功后覆盖缓存，
+  并重新读取当前资源的部署与诊断设置。无法解析的旧缓存会记录服务端警告并按未命中处理。
+  刷新失败时继续显示旧缓存并提示失败原因；错误结果不会写入缓存。`./start.sh new` 会一并清空缓存。
 - 只读，不修改任何 Azure 资源。
 - 通过 Azure Resource Graph 列出该身份可访问的所有订阅中 `OpenAI` / `AIServices` 账户，最多 200 个。
 - 选择后读取账户、部署和 Diagnostic settings，自动填写 Endpoint、Resource ID、Deployment，
@@ -136,11 +172,28 @@ Key 只从后端环境读取，不提供浏览器输入/读取密钥的接口。
 - 由 Azure Policy 创建的诊断设置（例如 `setByPolicy-*`）同样会被识别；日志可能已经在策略指定的
   Workspace 中，不一定需要手工再加一份。
 
+### 调用接口与流式
+
+请求卡片中的「调用接口」切换 Chat Completions / Responses，「输出方式」切换非流式 / 流式。
+页面顶部标签显示当前组合，历史列表每条记录也标注其调用方式。
+
+| 接口 | 请求 | 说明 |
+|---|---|---|
+| Chat Completions | `POST /chat/completions`，`messages` + `max_completion_tokens` | 流式时附带 `stream_options.include_usage`，否则流中没有用量 |
+| Responses | `POST /responses`，`input` + `max_output_tokens`，固定 `store:false` | 输出上限最少 16（切换时自动提升）；`store:false` 使 Azure 不保留响应对象（默认保留 30 天） |
+
+- 流式按 SSE 逐事件读取，回答实时显示。调用轴用“接收流式响应”区间替代“读取/解析响应”，
+  并增加“首个内容增量（Client 实测首 token）”点事件；区间详情包含 SSE 事件数、内容增量数、字节数、
+  首/末增量相对时间。
+- 流在完成事件前结束、收到 `error` / `response.failed` 事件、`incomplete`（如达到输出上限且无文本），
+  都记为失败；响应体与流的累计大小上限 4 MiB。错误只显示安全的错误码，不回显上游错误详情。
+- Responses 只发送单轮文本输入，不使用 `previous_response_id`、工具或后台模式。
+
 ## 如何验证关联
 
 1. 配置 Endpoint、Deployment、认证、Workspace ID 和 Foundry Resource ID。
 2. 点击“检查身份与日志连接”：读取过去一天的有限日志样本，查看 ID 候选字段。
-3. 执行一个小请求。每次执行可能产生费用；上限 4096 completion tokens，默认 256；
+3. 执行一个小请求。每次执行可能产生费用；上限 4096 输出 tokens，默认 256（Responses 最少 16）；
    没有 SDK 隐式重试、没有自动重放，最多同时运行 3 个模型请求。
 4. 查看实际返回的 `apim-request-id`、`x-request-id` 等原生响应头，以及区域、实际服务模型、
    剩余配额等响应元数据。应用为每次调用发送一个随机的 `x-ms-client-request-id`；
@@ -170,18 +223,25 @@ Key 只从后端环境读取，不提供浏览器输入/读取密钥的接口。
 ## TPS 指标
 
 TPS = 输出 token ÷ 时间。顶部指标卡显示端到端 TPS；调用时间轴卡片内的
-“TPS · 同一请求的不同时间基准”并列 5 种口径（真实 MI 调用示例：49 completion tokens）：
+“TPS · 同一请求的不同时间基准”并列 6 种口径（真实 MI 非流式调用示例：49 completion tokens）。
+输出 token 取 `completion_tokens`（Chat）或 `output_tokens`（Responses）：
 
 | 口径 | 来源 | 公式 | 示例 |
 | --- | --- | --- | --- |
-| 端到端 | Client 实测 | `completion_tokens ÷ Client 总耗时` | 24.9 tok/s |
-| HTTP 往返 | Client 实测 | `completion_tokens ÷（等待响应头 + 读取响应体）` | 30.6 tok/s |
+| 端到端 | Client 实测 | `输出 tokens ÷ Client 总耗时` | 24.9 tok/s |
+| HTTP 往返 | Client 实测 | `输出 tokens ÷（等待响应头 + 读取响应体或接收流）` | 30.6 tok/s |
+| 流式解码 | Client 实测（仅流式） | `(输出 − reasoning − 1) ÷ (末个内容增量 − 首个内容增量)` | 非流式显示“—” |
 | Azure 服务端 | `RequestResponse` | `properties.completionTokens ÷ DurationMs` | 62.7 tok/s |
 | 模型输出 | `AzureOpenAIRequestUsage` | `Σ generatedTokens ÷ timeToLastTokenMs` | 65.2 tok/s |
 | 引擎解码 | 响应体 `latency_checkpoint` | `(n − 1) ÷ (engine_ttlt_ms − engine_ttft_ms)`，缺失时退回 `1000 ÷ engine_tbt_ms` | 234.1 tok/s |
 
 - 分母越接近模型生成阶段，TPS 越高；各口径不可互相替代，也不能相减推算网络耗时。
-- `completion_tokens` 含 reasoning tokens；非流式调用的 `timeToLastTokenMs` 包含首 token 前的时间。
+- 输出 tokens 含 reasoning tokens；非流式 Chat Completions 的 `timeToLastTokenMs` 包含首 token 前的时间。
+  流式解码口径减去 reasoning tokens，因为它们在首个可见增量之前生成。
+- 流式解码只测 Client 收到内容增量的间隔。Azure 默认内容过滤会缓冲输出并
+  [分块返回](https://learn.microsoft.com/azure/ai-foundry/openai/concepts/content-streaming#comparison-of-content-filtering-modes)，
+  该值反映到达速率，可能远高于模型解码速度（实测 Chat 流约 2,557 tok/s，同一请求用量日志约 52 tok/s）；
+  部署改用 Asynchronous Filter 后才接近逐 token 速率。
 - Azure 口径只使用已匹配请求 ID 的日志记录；日志未入库或字段缺失时显示“—”和原因，不记为 0。
 
 ## 原始 Log Analytics 日志
@@ -242,8 +302,12 @@ TPS = 输出 token ÷ 时间。顶部指标卡显示端到端 TPS；调用时间
 - 响应体的 `latency_checkpoint` 单独显示为相对阶段图，不与绝对时间轴混合；`*_tbt_ms`（token 间隔）不画条形，只列数值。Azure 未公开这些字段的定义，各值的起点不一定相同。
 - 跨机器时钟可能不一致；本地区间耗时用单调时钟测量，不通过相减估算网络耗时。
 - 取消只停止本地等待/读取，不能保证 Azure 停止执行或不计费。
-- SQLite 保存配置快照、请求 ID、数值用量、阶段和脱敏关联证据；不保存 Prompt、回答、
+- SQLite 保存配置快照、请求 ID、数值用量、阶段和脱敏关联证据；实验记录中不保存 Prompt、回答、
   Key 或 Token。回答仅在服务进程内存中保留，重启后不恢复。
+- 例外：`preferences` 表保存**最近一次提交的 Prompt**（作为下次默认值），每次提交覆盖、只保留一条；
+  「恢复 .env 默认」或 `./start.sh new` 会删除它。不要在 Prompt 中放入不应落盘的内容。
+- `discovery_cache` 表保存资源发现结果（订阅/资源名、Endpoint、部署、诊断设置目标），不含密钥或 Token。
+- Responses 调用固定发送 `store:false`，Azure 不保留响应对象；诊断日志照常写入（实测与 Chat Completions 一样可关联）。
 - Azure 日志记录与导出只提取允许的元数据字段；不显示 Prompt、Completion、任意请求头等内容。
 - 底部原始日志面板显示 Azure 中存储的完整非空列，包括调用方 `objectId`（如 MI principal）、
   Azure 已遮蔽末段的 `CallerIPAddress`、租户/订阅/资源 ID。已验证的 `RequestResponse` 与
@@ -278,6 +342,8 @@ npm run test:e2e --prefix frontend
 查询延迟/部分失败、候选/确认关联、历史映射重查、调用时间轴与日志发现清单，以及基于真实日志结构的
 `requestTime` 解码、数组 token 字段和“等待两个日志类别”轮询；回查覆盖查询注入与时间窗口校验、
 本地实验标记、并发 429、错误脱敏、结果不落盘，以及多 Foundry 共用 Workspace（仅模拟数据）。
+调用方式覆盖 Chat/Responses × 流式/非流式、SSE 失败矩阵（`response.failed`、`error` 事件、`incomplete`、
+提前断流、4 MiB 上限、流式 429）、`store:false`，以及发现缓存命中/刷新覆盖/失败回退和“上次调用即默认值”。
 **Mock 测试不证明真实 Azure 关联成功**；真实验收需要配置自己的资源、身份与诊断字段。
 
 `tests/test_start_script.py` 用假的 `uv`/`npm` 和本地监听进程验证 [start.sh](start.sh)：只停止本项目的后端、

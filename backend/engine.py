@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+import re
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import timedelta
 from time import perf_counter
 from typing import TypeVar
@@ -42,6 +43,7 @@ from .models import (
     LookupBase,
     LookupResources,
     NewRun,
+    Preferences,
     RawLogs,
     Run,
     Settings,
@@ -57,7 +59,145 @@ SCOPE = "https://cognitiveservices.azure.com/.default"
 EXPECTED_CATEGORIES = ("RequestResponse", "AzureOpenAIRequestUsage")
 NO_WORKSPACE = "需要配置 Log Analytics Workspace ID 才能回查历史调用。"
 RAW_MARGIN = timedelta(minutes=5)
+RESPONSE_LIMIT = 4 * 1024 * 1024
+API_PATHS = {"chat_completions": "/chat/completions", "responses": "/responses"}
+NO_TEXT = "The endpoint did not return text or a refusal message."
 T = TypeVar("T")
+D = TypeVar("D", Foundries, FoundryDetail)
+
+
+def request_body(run: Run, prompt: str) -> dict[str, JsonValue]:
+    if run.api == "responses":
+        return {
+            "model": run.connection.deployment,
+            "input": prompt,
+            "max_output_tokens": run.max_completion_tokens,
+            "stream": run.stream,
+            # Azure otherwise retains the response for 30 days for later retrieval.
+            "store": False,
+        }
+    body: dict[str, JsonValue] = {
+        "model": run.connection.deployment,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_completion_tokens": run.max_completion_tokens,
+        "stream": run.stream,
+    }
+    if run.stream:
+        # Without include_usage a streamed chat completion reports no token counts.
+        body["stream_options"] = {"include_usage": True}
+    return body
+
+
+def chat_text(parsed: dict[str, JsonValue]) -> str:
+    choices = parsed.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise ValueError("The endpoint did not return a Chat Completions choices array.")
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        raise ValueError("The endpoint did not return a chat message.")
+    content = message.get("content") or message.get("refusal")
+    if not isinstance(content, str):
+        raise ValueError(NO_TEXT)
+    return content
+
+
+def incomplete(parsed: dict[str, JsonValue]) -> str:
+    details = parsed.get("incomplete_details")
+    reason = details.get("reason") if isinstance(details, dict) else None
+    if isinstance(reason, str) and re.fullmatch(r"[\w.-]{1,100}", reason):
+        return f"The response is incomplete ({reason}) and contains no text."
+    return NO_TEXT
+
+
+def responses_text(parsed: dict[str, JsonValue]) -> str:
+    output = parsed.get("output")
+    if not isinstance(output, list):
+        raise ValueError("The endpoint did not return a Responses output array.")
+    parts: list[str] = []
+    for item in output:
+        content = item.get("content") if isinstance(item, dict) else None
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for part in content if isinstance(content, list) else []:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text") if part.get("type") == "output_text" else part.get("refusal")
+            if isinstance(text, str):
+                parts.append(text)
+    if not parts:
+        raise ValueError(incomplete(parsed))
+    return "".join(parts)
+
+
+def stream_error(prefix: str, error: JsonValue) -> ValueError:
+    # Responses "error" events carry code at top level; Chat chunks nest it under "error".
+    nested = error.get("error") if isinstance(error, dict) else None
+    return ValueError(f"{prefix}: {provider_error_code({'error': nested or error})}")
+
+
+async def sse_payloads(response: httpx.Response) -> AsyncIterator[tuple[str, int]]:
+    """Yield (data payload, decoded bytes so far) for each server-sent event."""
+    data: list[str] = []
+    received = 0
+    async for line in response.aiter_lines():
+        received += len(line.encode()) + 1
+        if received > RESPONSE_LIMIT:
+            raise ValueError("Response exceeds the 4 MiB safety limit.")
+        if line.startswith("data:"):
+            data.append(line[5:].removeprefix(" "))
+        elif not line and data:
+            yield "\n".join(data), received
+            data.clear()
+    if data:
+        yield "\n".join(data), received
+
+
+def meta_fields(value: JsonValue, meta: dict[str, JsonValue]) -> None:
+    if isinstance(value, dict):
+        for key in ("id", "model", "system_fingerprint", "status"):
+            if isinstance(value.get(key), str) and value[key]:
+                meta[key] = value[key]
+
+
+def chat_chunk(
+    chunk: dict[str, JsonValue], meta: dict[str, JsonValue]
+) -> tuple[str, dict[str, JsonValue] | None, dict[str, JsonValue] | None]:
+    """Return (text delta, usage, final response) for one Chat Completions stream chunk."""
+    if "error" in chunk:
+        raise stream_error("Stream error", chunk["error"])
+    meta_fields(chunk, meta)
+    usage = chunk.get("usage")
+    text = ""
+    choices = chunk.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        delta = choices[0].get("delta")
+        if isinstance(delta, dict):
+            value = delta.get("content") or delta.get("refusal")
+            text = value if isinstance(value, str) else ""
+    # Chat streams end with a literal [DONE] line instead of a final object.
+    return text, usage if isinstance(usage, dict) else None, None
+
+
+def responses_chunk(
+    chunk: dict[str, JsonValue], meta: dict[str, JsonValue]
+) -> tuple[str, dict[str, JsonValue] | None, dict[str, JsonValue] | None]:
+    """Return (text delta, usage, final response) for one Responses API stream event."""
+    kind = chunk.get("type")
+    if kind in ("response.output_text.delta", "response.refusal.delta"):
+        delta = chunk.get("delta")
+        return (delta if isinstance(delta, str) else ""), None, None
+    if kind == "error":
+        raise stream_error("Stream error", chunk)
+    response = chunk.get("response")
+    if kind == "response.failed":
+        raise stream_error(
+            "Stream failed", response.get("error") if isinstance(response, dict) else None
+        )
+    meta_fields(response, meta)
+    if kind in ("response.completed", "response.incomplete") and isinstance(response, dict):
+        usage = response.get("usage")
+        return "", usage if isinstance(usage, dict) else None, response
+    return "", None, None
 
 
 class Engine:
@@ -144,7 +284,20 @@ class Engine:
 
     def create(self, request: NewRun) -> Run:
         run = Run(
-            connection=request.connection, max_completion_tokens=request.max_completion_tokens
+            connection=request.connection,
+            max_completion_tokens=request.max_completion_tokens,
+            api=request.api,
+            stream=request.stream,
+        )
+        # Only a submitted call becomes the next default; editing the form does not.
+        self.store.save_preferences(
+            Preferences(
+                connection=request.connection,
+                prompt=request.prompt,
+                max_completion_tokens=request.max_completion_tokens,
+                api=request.api,
+                stream=request.stream,
+            )
         )
         self.runs[run.id] = run
         self.save(run)
@@ -178,17 +331,14 @@ class Engine:
                     headers["Authorization"] = f"Bearer {token.token}"
                 self.end(run, auth)
                 current = self.begin(run, "HTTP request / waiting for headers")
+                sent = current[1]
+                body: bytes | None = None
                 async with self.client_factory() as client:
                     async with client.stream(
                         "POST",
-                        run.connection.endpoint + "/chat/completions",
+                        run.connection.endpoint + API_PATHS[run.api],
                         headers=headers,
-                        json={
-                            "model": run.connection.deployment,
-                            "messages": [{"role": "user", "content": prompt}],
-                            "max_completion_tokens": run.max_completion_tokens,
-                            "stream": False,
-                        },
+                        json=request_body(run, prompt),
                     ) as response:
                         run.http_status = response.status_code
                         response_headers = dict(response.headers)
@@ -207,34 +357,34 @@ class Engine:
                                 },
                             )
                         )
-                        current = self.begin(run, "Reading non-streaming response body")
-                        body = bytearray()
-                        async for chunk in response.aiter_bytes():
-                            body.extend(chunk)
-                            if len(body) > 4 * 1024 * 1024:
-                                raise ValueError("Response exceeds the 4 MiB safety limit.")
-                        self.end(run, current)
-                current = self.begin(run, "Parsing response")
-                parsed = JSON_OBJECT.validate_json(bytes(body))
-                run.response_meta = response_meta(response_headers, parsed)
-                if run.http_status is not None and not 200 <= run.http_status < 300:
-                    raise ValueError(f"HTTP {run.http_status}: {provider_error_code(parsed)}")
-                usage = parsed.get("usage")
-                if isinstance(usage, dict):
-                    run.usage = self.numeric_usage(usage)
-                choices = parsed.get("choices")
-                if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-                    raise ValueError(
-                        "The endpoint did not return a Chat Completions choices array."
+                        # Error responses carry a JSON body even when streaming was requested.
+                        if run.stream and not response.is_error:
+                            current = self.begin(run, "Receiving stream")
+                            meta = await self.read_stream(run, response, current, sent)
+                            run.response_meta = response_meta(response_headers, meta)
+                            self.end(run, current)
+                        else:
+                            current = self.begin(run, "Reading non-streaming response body")
+                            buffer = bytearray()
+                            async for chunk in response.aiter_bytes():
+                                buffer.extend(chunk)
+                                if len(buffer) > RESPONSE_LIMIT:
+                                    raise ValueError("Response exceeds the 4 MiB safety limit.")
+                            body = bytes(buffer)
+                            self.end(run, current)
+                if body is not None:
+                    current = self.begin(run, "Parsing response")
+                    parsed = JSON_OBJECT.validate_json(body)
+                    run.response_meta = response_meta(response_headers, parsed)
+                    if run.http_status is not None and not 200 <= run.http_status < 300:
+                        raise ValueError(f"HTTP {run.http_status}: {provider_error_code(parsed)}")
+                    usage = parsed.get("usage")
+                    if isinstance(usage, dict):
+                        run.usage = self.numeric_usage(usage)
+                    run.answer = (
+                        responses_text(parsed) if run.api == "responses" else chat_text(parsed)
                     )
-                message = choices[0].get("message")
-                if not isinstance(message, dict):
-                    raise ValueError("The endpoint did not return a chat message.")
-                content = message.get("content") or message.get("refusal")
-                if not isinstance(content, str):
-                    raise ValueError("The endpoint did not return text or a refusal message.")
-                run.answer = content
-                self.end(run, current)
+                    self.end(run, current)
                 run.status = "succeeded"
         except asyncio.CancelledError:
             run.status = "cancelled"
@@ -264,6 +414,66 @@ class Engine:
             elif isinstance(value, dict):
                 result[key] = Engine.numeric_usage(value)
         return result
+
+    async def read_stream(
+        self, run: Run, response: httpx.Response, timed: tuple[Event, float], sent: float
+    ) -> dict[str, JsonValue]:
+        """Consume an SSE body, growing run.answer in memory so polling shows it live."""
+        handle = responses_chunk if run.api == "responses" else chat_chunk
+        event, started = timed
+        meta: dict[str, JsonValue] = {}
+        final: dict[str, JsonValue] | None = None
+        completed = False
+        events = deltas = received = 0
+        first: float | None = None
+        last: float | None = None
+        run.answer = ""
+        try:
+            async for payload, size in sse_payloads(response):
+                events, received = events + 1, size
+                if payload == "[DONE]":
+                    completed = True
+                    continue
+                text, usage, done = handle(JSON_OBJECT.validate_json(payload), meta)
+                if usage is not None:
+                    run.usage = self.numeric_usage(usage)
+                if done is not None:
+                    final, completed = done, True
+                if not text:
+                    continue
+                last = perf_counter()
+                deltas += 1
+                run.answer += text
+                if first is None:
+                    first = last
+                    run.events.append(
+                        Event(
+                            title="First content delta",
+                            lane="call",
+                            kind="point",
+                            status="observed",
+                            details={
+                                "ttft_ms": round((first - sent) * 1000, 2),
+                                "after_headers_ms": round((first - started) * 1000, 2),
+                            },
+                        )
+                    )
+                    self.save(run)
+        finally:
+            event.details = {
+                "sse_events": events,
+                "content_deltas": deltas,
+                "bytes": received,
+                "completed": completed,
+            }
+            if first is not None and last is not None:
+                event.details["first_delta_after_ms"] = round((first - started) * 1000, 2)
+                event.details["last_delta_after_ms"] = round((last - started) * 1000, 2)
+        if not completed:
+            raise ValueError("The stream ended before completion.")
+        if not run.answer:
+            raise ValueError(incomplete(final) if final is not None else NO_TEXT)
+        return meta
 
     def start_query(self, run: Run, automatic: bool = False) -> bool:
         previous = self.log_tasks.get(run.id)
@@ -414,20 +624,66 @@ class Engine:
                 return failed(f"资源发现失败：{describe(exc)}")
 
     async def foundries(self, body: DiscoveryBase) -> Foundries:
-        return await self.discover(
+        return await self.cached(
             "foundries",
-            lambda: self.discovery.foundries(body),
-            lambda message: Foundries(state="error", message=message, checked_at=now()),
+            body,
+            "",
+            Foundries,
+            lambda: self.discover(
+                "foundries",
+                lambda: self.discovery.foundries(body),
+                lambda message: Foundries(state="error", message=message, checked_at=now()),
+            ),
         )
 
     async def foundry(self, body: FoundryQuery) -> FoundryDetail:
-        return await self.discover(
+        return await self.cached(
             "foundry",
-            lambda: self.discovery.foundry(body),
-            lambda message: FoundryDetail(
-                state="error", message=message, checked_at=now(), resource_id=body.resource_id
+            body,
+            body.resource_id,
+            FoundryDetail,
+            lambda: self.discover(
+                "foundry",
+                lambda: self.discovery.foundry(body),
+                lambda message: FoundryDetail(
+                    state="error", message=message, checked_at=now(), resource_id=body.resource_id
+                ),
             ),
         )
+
+    def cache_hit(self, kind: str, identity: str, resource_id: str, model: type[D]) -> D | None:
+        data = self.store.cached_discovery(kind, identity, resource_id)
+        if data is None:
+            return None
+        try:
+            return model.model_validate_json(data).model_copy(update={"cached": True})
+        except ValidationError:
+            # A row from an older schema is a cache miss, not an error.
+            logger.warning("Ignoring invalid discovery cache: kind=%s.", kind)
+            return None
+
+    async def cached(
+        self,
+        kind: str,
+        body: DiscoveryBase,
+        resource_id: str,
+        model: type[D],
+        fetch: Callable[[], Awaitable[D]],
+    ) -> D:
+        identity = body.identity_key()
+        if not body.refresh:
+            hit = self.cache_hit(kind, identity, resource_id, model)
+            if hit is not None:
+                return hit
+        fresh = await fetch()
+        if fresh.state != "error":
+            self.store.cache_discovery(kind, identity, resource_id, fresh)
+            return fresh
+        # A failed refresh never overwrites the last good result; show both instead.
+        previous = self.cache_hit(kind, identity, resource_id, model)
+        if previous is None:
+            return fresh
+        return previous.model_copy(update={"refresh_error": fresh.message})
 
     async def lookup_resources(self, body: LookupBase) -> LookupResources:
         if not body.connection.workspace_id:

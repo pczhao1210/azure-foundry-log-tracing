@@ -1,8 +1,14 @@
+import logging
 import sqlite3
 from collections.abc import Iterable
 from pathlib import Path
 
-from .models import Run, now
+from pydantic import BaseModel, ValidationError
+
+from .models import Preferences, Run, now
+
+PREFERENCES_KEY = "defaults"
+logger = logging.getLogger(__name__)
 
 
 class Store:
@@ -13,6 +19,17 @@ class Store:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS runs "
                 "(id TEXT PRIMARY KEY, created_at TEXT NOT NULL, data TEXT NOT NULL)"
+            )
+            # Last successful read per discovery identity; a refresh overwrites it.
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS discovery_cache "
+                "(kind TEXT NOT NULL, identity TEXT NOT NULL, resource_id TEXT NOT NULL, "
+                "fetched_at TEXT NOT NULL, data TEXT NOT NULL, "
+                "PRIMARY KEY (kind, identity, resource_id))"
+            )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS preferences "
+                "(key TEXT PRIMARY KEY, updated_at TEXT NOT NULL, data TEXT NOT NULL)"
             )
         self.path.chmod(0o600)
 
@@ -50,6 +67,50 @@ class Store:
                 ids,
             ).fetchall()
         return {request_id: run_id for request_id, run_id in rows}
+
+    def cache_discovery(self, kind: str, identity: str, resource_id: str, value: BaseModel) -> None:
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO discovery_cache VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(kind, identity, resource_id) "
+                "DO UPDATE SET fetched_at=excluded.fetched_at, data=excluded.data",
+                (kind, identity, resource_id.lower(), now(), value.model_dump_json()),
+            )
+
+    def cached_discovery(self, kind: str, identity: str, resource_id: str = "") -> str | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT data FROM discovery_cache "
+                "WHERE kind = ? AND identity = ? AND resource_id = ?",
+                (kind, identity, resource_id.lower()),
+            ).fetchone()
+        return row[0] if row else None
+
+    def save_preferences(self, preferences: Preferences) -> None:
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO preferences VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET updated_at=excluded.updated_at, data=excluded.data",
+                (PREFERENCES_KEY, preferences.saved_at, preferences.model_dump_json()),
+            )
+
+    def preferences(self) -> Preferences | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT data FROM preferences WHERE key = ?", (PREFERENCES_KEY,)
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            return Preferences.model_validate_json(row[0])
+        except ValidationError:
+            # A stale row that no longer validates must not block startup; fall back to .env.
+            logger.warning("Ignoring invalid saved preferences; using .env defaults.")
+            return None
+
+    def clear_preferences(self) -> None:
+        with self.connect() as db:
+            db.execute("DELETE FROM preferences WHERE key = ?", (PREFERENCES_KEY,))
 
     def recover(self) -> None:
         with self.connect() as db:

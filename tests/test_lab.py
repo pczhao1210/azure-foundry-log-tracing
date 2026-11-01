@@ -31,7 +31,10 @@ from backend.models import (
     Connection,
     DiscoveryBase,
     Event,
+    Foundries,
+    FoundryDetail,
     FoundryQuery,
+    FoundrySummary,
     LogRecord,
     LogResult,
     LookupBase,
@@ -216,8 +219,13 @@ async def test_success_captures_ids_without_persisting_content(connection, setti
     assert run.answer == "private answer"
     assert run.duration_ms is not None and run.duration_ms >= 0
     raw = engine.store.path.read_bytes()
-    for secret in (b"private prompt", b"private answer", b"secret-api-key", b"secret-cookie"):
+    for secret in (b"private answer", b"secret-api-key", b"secret-cookie"):
         assert secret not in raw
+    # The prompt is kept only as the next form default, never inside run records.
+    with engine.store.connect() as db:
+        records = " ".join(row[0] for row in db.execute("SELECT data FROM runs"))
+    assert "private prompt" not in records and "private answer" not in records
+    assert engine.store.preferences().prompt == "private prompt"
     assert all(event.status != "running" for event in run.events)
     await engine.close()
 
@@ -1420,3 +1428,374 @@ def test_discovery_api_validates_input_and_hides_arm_errors(settings):
             assert client.post("/api/discovery/foundry", json=invalid).status_code == 422
         assert client.post("/api/discovery/foundries", content="{}").status_code == 415
     assert Store(settings.database_path).list() == []
+
+
+def sse(*events, done=False):
+    lines = []
+    for event in events:
+        if isinstance(event, dict) and "type" in event:
+            lines.append(f"event: {event['type']}")
+        lines.append(f"data: {json.dumps(event)}")
+        lines.append("")
+    if done:
+        lines += ["data: [DONE]", ""]
+    return httpx.Response(
+        200,
+        headers={"apim-request-id": "azure-stream", "content-type": "text/event-stream"},
+        content="\n".join(lines).encode(),
+    )
+
+
+def chat_delta(content):
+    return {"id": "chatcmpl-s", "model": "gpt-s", "choices": [{"delta": {"content": content}}]}
+
+
+def responses_final(kind="response.completed", status="completed", **extra):
+    usage = {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}
+    response = {"id": "resp_1", "model": "gpt-r", "status": status, "usage": usage, **extra}
+    return {"type": kind, "response": response}
+
+
+async def test_stream_chat_reads_deltas_usage_and_client_ttft(connection, settings):
+    sent = []
+
+    async def handler(request):
+        sent.append(request)
+        return sse(
+            {"choices": [], "prompt_filter_results": [{"prompt_index": 0}]},
+            {"id": "chatcmpl-s", "model": "gpt-s", "choices": [{"delta": {"role": "assistant"}}]},
+            chat_delta("private "),
+            chat_delta("answer"),
+            {"id": "chatcmpl-s", "choices": [{"delta": {}, "finish_reason": "stop"}]},
+            {
+                "id": "chatcmpl-s",
+                "choices": [],
+                "usage": {"completion_tokens": 2, "total_tokens": 7},
+            },
+            done=True,
+        )
+
+    engine = engine_for(settings, handler)
+    request = NewRun(connection=connection, prompt="private prompt", stream=True)
+    run = engine.create(request)
+    await settle(engine, run)
+    body = json.loads(sent[0].content)
+    assert sent[0].url.path == "/openai/v1/chat/completions"
+    assert body["stream"] is True and body["stream_options"] == {"include_usage": True}
+    assert run.status == "succeeded" and run.answer == "private answer"
+    assert run.usage == {"completion_tokens": 2, "total_tokens": 7}
+    assert run.response_meta["response.id"] == "chatcmpl-s"
+    assert run.response_meta["response.model"] == "gpt-s"
+    titles = [event.title for event in run.events]
+    assert "Reading non-streaming response body" not in titles
+    assert "Parsing response" not in titles
+    stream = next(event for event in run.events if event.title == "Receiving stream")
+    first = next(event for event in run.events if event.title == "First content delta")
+    assert stream.status == "success"
+    assert stream.details["sse_events"] == 7 and stream.details["content_deltas"] == 2
+    assert stream.details["completed"] is True and stream.details["bytes"] > 0
+    assert 0 <= stream.details["first_delta_after_ms"] <= stream.details["last_delta_after_ms"]
+    assert first.kind == "point" and first.details["ttft_ms"] >= first.details["after_headers_ms"]
+    assert b"private answer" not in engine.store.path.read_bytes()
+    saved = engine.store.preferences()
+    assert saved.stream is True and saved.api == "chat_completions"
+    await engine.close()
+
+
+async def test_responses_api_sends_store_false_and_reads_output(connection, settings):
+    sent = []
+
+    async def handler(request):
+        sent.append(request)
+        return httpx.Response(
+            200,
+            headers={"apim-request-id": "azure-resp"},
+            json={
+                "id": "resp_1",
+                "model": "gpt-r",
+                "status": "completed",
+                "output": [
+                    {"type": "reasoning", "summary": []},
+                    {
+                        "type": "message",
+                        "content": [
+                            {"type": "output_text", "text": "private ", "annotations": []},
+                            {"type": "output_text", "text": "answer", "annotations": []},
+                        ],
+                    },
+                ],
+                "usage": {
+                    "input_tokens": 5,
+                    "output_tokens": 30,
+                    "output_tokens_details": {"reasoning_tokens": 28},
+                    "total_tokens": 35,
+                },
+            },
+        )
+
+    engine = engine_for(settings, handler)
+    run = engine.create(
+        NewRun(connection=connection, prompt="hi", api="responses", max_completion_tokens=32)
+    )
+    await settle(engine, run)
+    assert sent[0].url.path == "/openai/v1/responses"
+    assert json.loads(sent[0].content) == {
+        "model": "test-deployment",
+        "input": "hi",
+        "max_output_tokens": 32,
+        "stream": False,
+        "store": False,
+    }
+    assert run.status == "succeeded" and run.answer == "private answer"
+    assert run.api == "responses" and run.stream is False
+    assert run.usage["output_tokens_details"] == {"reasoning_tokens": 28}
+    assert run.response_meta["response.status"] == "completed"
+    assert run.response_meta["response.id"] == "resp_1"
+    await engine.close()
+
+
+async def test_responses_stream_reads_typed_events(connection, settings):
+    async def handler(request):
+        body = json.loads(request.content)
+        assert body["stream"] is True and body["store"] is False
+        assert "stream_options" not in body
+        return sse(
+            {"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}},
+            {"type": "response.output_item.added", "item": {"type": "message"}},
+            {"type": "response.output_text.delta", "delta": "private "},
+            {"type": "response.output_text.delta", "delta": "answer"},
+            {"type": "response.output_text.done", "text": "private answer"},
+            responses_final(),
+        )
+
+    engine = engine_for(settings, handler)
+    run = engine.create(NewRun(connection=connection, prompt="hi", api="responses", stream=True))
+    await settle(engine, run)
+    assert run.status == "succeeded" and run.answer == "private answer"
+    assert run.usage["output_tokens"] == 3
+    assert run.response_meta["response.status"] == "completed"
+    assert run.response_meta["response.model"] == "gpt-r"
+    stream = next(event for event in run.events if event.title == "Receiving stream")
+    assert stream.details["content_deltas"] == 2 and stream.details["sse_events"] == 6
+    await engine.close()
+
+
+@pytest.mark.parametrize(
+    ("api", "response", "message"),
+    [
+        (
+            "responses",
+            sse(
+                {"type": "response.output_text.delta", "delta": "partial"},
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "status": "failed",
+                        "error": {"code": "server_error", "message": "secret detail"},
+                    },
+                },
+            ),
+            "Stream failed: server_error",
+        ),
+        (
+            "responses",
+            sse({"type": "error", "code": "rate_limit_exceeded", "message": "secret detail"}),
+            "Stream error: rate_limit_exceeded",
+        ),
+        (
+            "responses",
+            sse(
+                responses_final(
+                    "response.incomplete",
+                    "incomplete",
+                    incomplete_details={"reason": "max_output_tokens"},
+                )
+            ),
+            "The response is incomplete (max_output_tokens) and contains no text.",
+        ),
+        (
+            "chat_completions",
+            sse({"error": {"code": "content_filter", "message": "secret detail"}}),
+            "Stream error: content_filter",
+        ),
+        ("chat_completions", sse(chat_delta("partial")), "The stream ended before completion."),
+        (
+            "chat_completions",
+            sse(chat_delta("x" * 4 * 1024 * 1024), done=True),
+            "Response exceeds the 4 MiB safety limit.",
+        ),
+        (
+            "chat_completions",
+            httpx.Response(
+                429, json={"error": {"code": "RateLimitExceeded", "message": "secret detail"}}
+            ),
+            "HTTP 429: RateLimitExceeded",
+        ),
+    ],
+)
+async def test_stream_failures_are_safe_and_not_retried(
+    connection, settings, api, response, message
+):
+    calls = 0
+
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        return response
+
+    engine = engine_for(settings, handler)
+    run = engine.create(NewRun(connection=connection, prompt="hi", api=api, stream=True))
+    await settle(engine, run)
+    assert calls == 1
+    assert run.status == "failed" and run.error == message
+    assert "secret detail" not in run.model_dump_json()
+    assert all(event.status != "running" for event in run.events)
+    await engine.close()
+
+
+async def test_responses_non_stream_incomplete_without_text(connection, settings):
+    async def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [{"type": "reasoning", "summary": []}],
+            },
+        )
+
+    engine = engine_for(settings, handler)
+    run = engine.create(NewRun(connection=connection, prompt="hi", api="responses"))
+    await settle(engine, run)
+    assert run.error == "The response is incomplete (max_output_tokens) and contains no text."
+    await engine.close()
+
+
+def test_responses_requires_minimum_output_tokens(connection):
+    with pytest.raises(ValidationError):
+        NewRun(connection=connection, prompt="hi", api="responses", max_completion_tokens=15)
+    assert NewRun(connection=connection, prompt="hi", max_completion_tokens=1).api == (
+        "chat_completions"
+    )
+
+
+class FakeDiscovery:
+    def __init__(self):
+        self.calls = []
+        self.fail = False
+
+    def result(self, kind, name):
+        self.calls.append((kind, name))
+        if self.fail:
+            raise ValueError("unreachable")
+
+    async def foundries(self, body):
+        self.result("foundries", len(self.calls))
+        return Foundries(
+            state="ok",
+            checked_at=f"t{len(self.calls)}",
+            items=[FoundrySummary(resource_id=RESOURCE, name=f"foundry-{len(self.calls)}")],
+        )
+
+    async def foundry(self, body):
+        self.result("foundry", body.resource_id)
+        return FoundryDetail(
+            state="ok", checked_at=f"t{len(self.calls)}", resource_id=body.resource_id
+        )
+
+
+async def test_discovery_cache_serves_refreshes_and_survives_failed_refresh(settings):
+    async def model(request):
+        pytest.fail("Discovery must not call the model.")
+
+    fake = FakeDiscovery()
+    engine = engine_for(settings, model, discovery=fake)
+    first = await engine.foundries(DiscoveryBase())
+    assert first.cached is False and first.items[0].name == "foundry-1"
+    cached = await engine.foundries(DiscoveryBase())
+    assert cached.cached is True and cached.checked_at == "t1" and len(fake.calls) == 1
+    refreshed = await engine.foundries(DiscoveryBase(refresh=True))
+    assert refreshed.cached is False and refreshed.items[0].name == "foundry-2"
+    assert (await engine.foundries(DiscoveryBase())).items[0].name == "foundry-2"
+    fake.fail = True
+    kept = await engine.foundries(DiscoveryBase(refresh=True))
+    assert kept.cached is True and kept.items[0].name == "foundry-2"
+    assert "资源发现失败" in kept.refresh_error
+    # The failure did not overwrite the last good result.
+    assert (await engine.foundries(DiscoveryBase())).refresh_error == ""
+    other = await engine.foundries(DiscoveryBase(logs_auth_mode="azure_cli"))
+    assert other.state == "error" and other.cached is False
+
+    fake.fail = False
+    detail = await engine.foundry(FoundryQuery(resource_id=RESOURCE))
+    assert detail.cached is False
+    again = await engine.foundry(FoundryQuery(resource_id=RESOURCE.upper()))
+    assert again.cached is True and again.resource_id == RESOURCE
+    assert [call for call in fake.calls if call[0] == "foundry"] == [("foundry", RESOURCE)]
+    await engine.close()
+
+
+def test_submitted_call_becomes_default_until_reset(settings, connection):
+    async def handler(request):
+        return success_response()
+
+    engine = engine_for(settings, handler)
+    with TestClient(create_app(settings, engine), base_url="http://localhost") as client:
+        initial = client.get("/api/config").json()
+        assert initial["source"] == "env" and initial["saved_at"] is None
+        assert initial["api"] == "chat_completions" and initial["stream"] is False
+        assert initial["max_completion_tokens"] == 256 and initial["prompt"] == ""
+        response = client.post(
+            "/api/runs",
+            json={
+                "connection": {**connection.model_dump(), "deployment": "picked-model"},
+                "prompt": "remember me",
+                "max_completion_tokens": 64,
+                "api": "responses",
+                "stream": True,
+            },
+        )
+        assert response.status_code == 202
+        saved = client.get("/api/config").json()
+        assert saved["source"] == "saved" and saved["saved_at"]
+        assert saved["deployment"] == "picked-model"
+        assert saved["endpoint"] == connection.endpoint
+        assert saved["resource_id"] == RESOURCE
+        assert saved["prompt"] == "remember me" and saved["max_completion_tokens"] == 64
+        assert saved["api"] == "responses" and saved["stream"] is True
+        assert saved["api_key_configured"] is True
+        assert "secret-api-key" not in json.dumps(saved)
+        history = client.get("/api/runs").json()
+        assert history[0]["api"] == "responses" and history[0]["stream"] is True
+        reset = client.post("/api/preferences/reset", json={}).json()
+        assert reset["source"] == "env" and reset["deployment"] == settings.foundry_deployment
+        assert client.get("/api/config").json()["source"] == "env"
+
+
+def test_invalid_saved_preferences_fall_back_to_env(settings, caplog):
+    store = Store(settings.database_path)
+    with store.connect() as db:
+        db.execute("INSERT INTO preferences VALUES ('defaults', 'now', '{\"broken\": 1}')")
+    assert store.preferences() is None
+    assert "Ignoring invalid saved preferences; using .env defaults." in caplog.text
+    assert "broken" not in caplog.text
+
+
+async def test_invalid_discovery_cache_is_logged_and_refetched(settings, caplog):
+    async def model(request):
+        pytest.fail("Discovery must not call the model.")
+
+    fake = FakeDiscovery()
+    engine = engine_for(settings, model, discovery=fake)
+    body = DiscoveryBase()
+    with engine.store.connect() as db:
+        db.execute(
+            "INSERT INTO discovery_cache VALUES (?, ?, '', 'now', ?)",
+            ("foundries", body.identity_key(), '{"items": "private-invalid-value"}'),
+        )
+    result = await engine.foundries(body)
+    assert not result.cached and result.state == "ok" and len(fake.calls) == 1
+    assert "Ignoring invalid discovery cache: kind=foundries." in caplog.text
+    assert "private-invalid-value" not in caplog.text
+    assert (await engine.foundries(body)).cached
+    await engine.close()
