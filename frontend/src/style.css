@@ -304,6 +304,150 @@ h1 {
   color: #a87739;
   background: #fff8ec;
 }
+.warn-text {
+  color: #a87739;
+}
+.foundry-picker > label {
+  margin-top: 0;
+}
+.combo {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-top: 6px;
+}
+.combo input {
+  flex: 1;
+  min-width: 0;
+}
+.combo-list {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 20;
+  max-height: 280px;
+  overflow: auto;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: #fff;
+  border: 1px solid #dce2ee;
+  border-radius: 8px;
+  box-shadow: 0 10px 24px #1c2b4a1f;
+}
+.combo-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.combo-list li > span {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.combo-list strong {
+  font-size: 12px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.combo-list small {
+  color: #8590a5;
+  font-size: 10px;
+}
+.combo-list li.active {
+  background: #f1f4fd;
+}
+.combo-list li[aria-selected="true"] {
+  color: #3a60c6;
+}
+.foundry-status {
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+}
+.foundry-status .hint {
+  margin-top: 0;
+}
+.log-targets ul {
+  list-style: none;
+  margin: 7px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.log-target {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid #e6eaf2;
+  border-radius: 7px;
+  background: #fbfcfe;
+}
+.log-target.current {
+  border-color: #b9c9f3;
+  background: #f4f7ff;
+}
+.log-target-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.log-target-main small {
+  color: #8590a5;
+  font-size: 10px;
+}
+.log-target-main small.warn-text {
+  color: #a87739;
+}
+.target-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 3px;
+}
+.target-tags .tag {
+  margin-left: 0;
+}
+.tag.ok {
+  background: #e8f6ee;
+  color: #2f7d50;
+}
+.tag.miss {
+  background: #fff3e2;
+  color: #a5701f;
+}
+.target-current {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #3a60c6;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .spin {
+    animation: none;
+  }
+}
 .divider {
   height: 1px;
   background: #edf0f6;
@@ -719,9 +863,6 @@ details summary .quiet {
   border-radius: 3px;
   min-width: 3px;
   max-width: 100%;
-}
-.bar.log_query {
-  background: #71b7b4;
 }
 .bar.error {
   background: #df9391;
@@ -1219,6 +1360,187 @@ td .tag {
 .candidates code {
   color: #526689;
 }
+.discovery-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+.discovery-item {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  padding: 13px 14px;
+  border: 1px solid #e4e9f2;
+  border-left: 3px solid #c9d1df;
+  border-radius: 8px;
+  background: #fff;
+  color: inherit;
+  text-align: left;
+}
+button.discovery-item:hover {
+  border-top-color: #c9d4ea;
+  border-right-color: #c9d4ea;
+  border-bottom-color: #c9d4ea;
+  background: #fafbff;
+}
+.discovery-item.found {
+  border-left-color: #30816b;
+}
+.discovery-item.candidate {
+  border-left-color: #aa8440;
+}
+.discovery-item.waiting {
+  border-left-color: #5075c7;
+  background: #fbfcff;
+}
+.discovery-item.missing,
+.discovery-item.error {
+  border-left-color: #c85a58;
+}
+.discovery-item.skipped,
+.discovery-item.idle {
+  background: #fafbfd;
+}
+.discovery-item.selected {
+  background: #f7f9ff;
+  box-shadow: 0 0 0 2px #c9d6f5;
+}
+.discovery-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+}
+.discovery-head > span:nth-child(2) {
+  flex: 1;
+  min-width: 0;
+}
+.discovery-head strong {
+  display: block;
+  font-size: 12px;
+  color: #2d3b57;
+}
+.discovery-head small {
+  display: block;
+  font-size: 9px;
+  color: #9aa6bb;
+  overflow-wrap: anywhere;
+}
+.discovery-icon {
+  flex-shrink: 0;
+  margin-top: 1px;
+  color: #a6b0c2;
+}
+.discovery-icon.found {
+  color: #30816b;
+}
+.discovery-icon.candidate {
+  color: #aa8440;
+}
+.discovery-icon.waiting {
+  color: #5075c7;
+}
+.discovery-icon.missing,
+.discovery-icon.error {
+  color: #c85a58;
+}
+.discovery-status {
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: #eef1f6;
+  color: #7c8aa2;
+  font-size: 9px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.discovery-status.found {
+  background: #eaf6f1;
+  color: #30816b;
+}
+.discovery-status.candidate {
+  background: #fff6e4;
+  color: #aa8440;
+}
+.discovery-status.waiting {
+  background: #edf3ff;
+  color: #5075c7;
+}
+.discovery-status.missing,
+.discovery-status.error {
+  background: #fff0ed;
+  color: #c85a58;
+}
+.discovery-evidence code {
+  display: inline-block;
+  padding: 3px 7px;
+  border-radius: 4px;
+  background: #f2f8f5;
+  color: #30816b;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+.discovery-item.candidate .discovery-evidence code {
+  background: #fff6e4;
+  color: #aa8440;
+}
+.discovery-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 8px 12px;
+  font-size: 11px;
+  color: #3a4a68;
+}
+.discovery-facts > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.discovery-facts small {
+  display: block;
+  font-size: 9px;
+  color: #9aa6bb;
+}
+.discovery-note {
+  font-size: 10px;
+  color: #8a96ab;
+}
+.discovery-steps {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 14px;
+  font-size: 10px;
+  color: #8a96ab;
+}
+.discovery-steps > span {
+  margin-right: 4px;
+}
+.discovery-steps button {
+  padding: 3px 10px;
+  border: 1px solid #e1e6ef;
+  border-radius: 999px;
+  background: #fff;
+  color: #5d6e8e;
+  font-size: 10px;
+}
+.discovery-steps button.hit {
+  border-color: #bfe0d4;
+  background: #eaf6f1;
+  color: #30816b;
+}
+.discovery-steps button.running,
+.discovery-steps button.waiting {
+  border-style: dashed;
+  color: #5075c7;
+}
+.discovery-steps button.error {
+  border-color: #f1cfcd;
+  color: #c85a58;
+}
+.discovery-steps button[aria-pressed="true"] {
+  box-shadow: 0 0 0 2px #c9d6f5;
+}
 footer {
   font-size: 9px;
   text-align: center;
@@ -1344,6 +1666,9 @@ footer {
   }
   .lookup-note {
     padding: 0 17px 12px;
+  }
+  .discovery-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
   .mode-switch {
     display: flex;

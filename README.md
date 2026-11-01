@@ -86,6 +86,23 @@ Key 只从后端环境读取，不提供浏览器输入/读取密钥的接口。
   不自动修改诊断设置、不创建 Azure 资源、不写入 Azure 日志表。
 - Private Link、网络限制、其他云环境和其他日志表需要单独适配。
 
+### 资源发现
+
+配置卡顶部的「Foundry 资源」可以直接输入名称，或从下拉列表选择；刷新按钮重新拉取列表。
+
+- 使用当前「日志查询身份」（Azure CLI 或 MI）调用 ARM，只读，不修改任何 Azure 资源。
+- 通过 Azure Resource Graph 列出该身份可访问的所有订阅中 `OpenAI` / `AIServices` 账户，最多 200 个。
+- 选择后读取账户、部署和 Diagnostic settings，自动填写 Endpoint、Resource ID、Deployment，
+  并在当前 Workspace 不在日志目标中时切换到第一个接收 `RequestResponse` 的 Workspace。
+- 需要资源/资源组/订阅上的 `Reader`（读取 Diagnostic settings 和部署），以及 Workspace 的读取权限
+  （解析 Workspace GUID）；缺权限时对应部分显示提示，其余字段仍可手动填写。
+- 「日志去向」列出每个 Log Analytics 目标及是否包含请求/用量日志，并提示：
+  - 没有任何 Workspace 接收 `RequestResponse`（例如只发往存储账户或 Event Hub）；
+  - 当前 Workspace ID 不在该资源的诊断目标中；
+  - `Dedicated`（资源专用表）模式，本版只查询 `AzureDiagnostics`。
+- 由 Azure Policy 创建的诊断设置（例如 `setByPolicy-*`）同样会被识别；日志可能已经在策略指定的
+  Workspace 中，不一定需要手工再加一份。
+
 ## 如何验证关联
 
 1. 配置 Endpoint、Deployment、认证、Workspace ID 和 Foundry Resource ID。
@@ -97,6 +114,9 @@ Key 只从后端环境读取，不提供浏览器输入/读取密钥的接口。
    它只会被回显，不会写入诊断日志，因此只有 Azure 返回请求 ID 后才查询日志。
 5. 日志查询限定目标 Resource ID 和调用开始前 5 分钟到后 15 分钟的事件时间窗口。
    日志延迟入库时继续查询相同窗口，不将查询时间当作请求时间。
+   若 Endpoint 子域名与 Resource ID 的账户名不同（如调用 japaneast、却查询 eastus2），
+   配置表单会立即告警，查不到记录时提示中也会说明；因为自定义子域名可能与账户名不同，
+   这只是告警，不阻止调用。
 6. 未配置 ID 字段时，检查已列出的常见候选字段，并记录“日志字段 = 响应头”形式的证据。
    `CorrelationId = apim-request-id` 属于内置的已验证规则，标记为“精确匹配”；
    其他相等组合标记为“候选”，先核验字段语义，再指定字段并勾选“我已核验”。
@@ -108,6 +128,9 @@ Key 只从后端环境读取，不提供浏览器输入/读取密钥的接口。
 自动查询首次立即执行，随后等待 20、30、45、60、90、120 秒（约 6 分钟）。
 成功调用会一直轮询到两个类别都出现；失败调用只等待 `RequestResponse`。
 到期仍缺失时会说明缺失的类别，可以手动继续。初次启用诊断设置后，数据可能较久才可查询。
+一直查不到时，先确认该 Foundry 的诊断设置确实发送到配置的 Workspace：
+`az monitor diagnostic-settings list --resource <Foundry Resource ID>`。
+订阅策略自动创建的设置可能发往另一个 Workspace 或存储账户。
 同一请求最多显示 100 条记录；截断和 Azure 部分结果会明确标注。
 实际 KQL（含资源和事件时间范围）可在 UI 查看。
 
@@ -148,7 +171,7 @@ TPS = 输出 token ÷ 时间。顶部指标卡显示端到端 TPS；调用时间
 - 只有 Azure 响应头 `apim-request-id` 会写入日志（`CorrelationId`）。经 LiteLLM 转发时，
   使用 LiteLLM 透传的响应头 `llm_provider-apim-request-id`；`x-request-id`、`chatcmpl-…`、
   客户端请求 ID 都查不到。LiteLLM 重试时每次上游调用的 ID 不同，只能查到对应那一次。
-- 结果包含来源 Foundry、精确匹配证据、结果码、服务端耗时、Token、Azure 时间轴、TPS 和原始日志行
+- 结果包含来源 Foundry、精确匹配证据、结果码、服务端耗时、Token、Azure 时间轴、日志发现清单、TPS 和原始日志行
   （时间窗口收窄到记录前后 5 分钟）。回查结果没有客户端阶段，因此只能计算 2 种 Azure TPS 口径，
   其余口径显示原因。
 - 若 ID 属于本应用发起的实验，标记“本应用发起”，可一键打开本地实验。
@@ -180,7 +203,9 @@ TPS = 输出 token ÷ 时间。顶部指标卡显示端到端 TPS；调用时间
   以及来自日志的 Azure 服务端处理区间（`requestTime + DurationMs`）和首/末 token 时长。
 - 首/末 token 时长没有绝对起点，按 `requestTime` 近似对齐并在事件详情中注明；
   用量记录的 `TimeGenerated` 是汇总时间（比请求晚约 1 分钟），不会绘制到调用轴。
-- 日志发现轴显示本地查询/等待，以及每条日志的 `ingestion_time()` 入库点。
+- 日志发现按类别（`RequestResponse`、`AzureOpenAIRequestUsage`）列出是否找到：已找到 / 候选待核验 /
+  等待入库 / 未找到 / 不适用（失败或取消的调用通常没有用量日志）。卡片显示匹配字段、关键元数据和来源 Foundry；
+  入库延迟只作为附注（请求开始后约 X s 可查询），查询过程以“第 n 次 · k 条”标签列出，不再绘制时间轴。
 - 响应体的 `latency_checkpoint` 单独显示为相对阶段图，不与绝对时间轴混合；`*_tbt_ms`（token 间隔）不画条形，只列数值。Azure 未公开这些字段的定义，各值的起点不一定相同。
 - 跨机器时钟可能不一致；本地区间耗时用单调时钟测量，不通过相减估算网络耗时。
 - 取消只停止本地等待/读取，不能保证 Azure 停止执行或不计费。
@@ -217,14 +242,14 @@ npm run test:e2e --prefix frontend
 所有 Azure/API 响应均由浏览器测试隔离模拟，不修改真实实验数据库。
 
 测试使用明确隔离的模拟 HTTP/Azure 响应，覆盖认证分支、取消、429 无重试、持久化脱敏、
-查询延迟/部分失败、候选/确认关联、历史映射重查、双时间轴，以及基于真实日志结构的
+查询延迟/部分失败、候选/确认关联、历史映射重查、调用时间轴与日志发现清单，以及基于真实日志结构的
 `requestTime` 解码、数组 token 字段和“等待两个日志类别”轮询；回查覆盖查询注入与时间窗口校验、
 本地实验标记、并发 429、错误脱敏、结果不落盘，以及多 Foundry 共用 Workspace（仅模拟数据）。
 **Mock 测试不证明真实 Azure 关联成功**；真实验收需要配置自己的资源、身份与诊断字段。
 
 主要代码：[Python API](backend/app.py)、[执行引擎](backend/engine.py)、
 [日志关联](backend/azure.py)、[React UI](frontend/src/App.tsx)、[时间轴](frontend/src/Timeline.tsx)、
-[历史回查](frontend/src/Lookup.tsx)。
+[日志发现](frontend/src/LogDiscovery.tsx)、[历史回查](frontend/src/Lookup.tsx)。
 
 官方参考：[Managed Identity](https://learn.microsoft.com/azure/foundry-classic/openai/how-to/managed-identity)、
 [诊断日志](https://learn.microsoft.com/azure/foundry/how-to/diagnostic-logging)、

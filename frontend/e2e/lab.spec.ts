@@ -117,7 +117,13 @@ async function fixtureApi(page: Page) {
         ended_at: null,
         duration_ms: null,
         status: "observed",
-        details: { ingestion_delay_ms: 7700 },
+        details: {
+          category: "RequestResponse",
+          TimeGenerated: after(1300),
+          ingestion_time: after(9000),
+          ingestion_delay_ms: 7700,
+          since_run_start_ms: 9000,
+        },
       },
       {
         id: "wait",
@@ -141,7 +147,7 @@ async function fixtureApi(page: Page) {
         ended_at: after(17000),
         duration_ms: 500,
         status: "success",
-        details: { query: "AzureDiagnostics" },
+        details: { query: "AzureDiagnostics", record_count: 1 },
       },
     ],
     logs: {
@@ -333,6 +339,65 @@ async function fixtureApi(page: Page) {
       rawCalls += 1;
       data = rawLogs;
     } else if (path === `/api/runs/${run.id}`) data = run;
+    else if (path === "/api/discovery/foundries")
+      data = {
+        state: "ok",
+        message: "找到 1 个可访问的 Foundry / Azure OpenAI 资源。",
+        checked_at: created,
+        limited: false,
+        items: [
+          {
+            resource_id: connection.resource_id,
+            name: "example",
+            location: "eastus2",
+            kind: "OpenAI",
+            resource_group: "test",
+            subscription_id: "00000000-0000-0000-0000-000000000001",
+            subscription: "Fixture subscription",
+            endpoint: connection.endpoint,
+          },
+        ],
+      };
+    else if (path === "/api/discovery/foundry")
+      data = {
+        state: "ok",
+        message: "",
+        checked_at: created,
+        resource_id: connection.resource_id,
+        name: "example",
+        location: "eastus2",
+        kind: "OpenAI",
+        endpoint: connection.endpoint,
+        deployments: [
+          {
+            name: connection.deployment,
+            model: "gpt-fixture",
+            version: "1",
+            format: "OpenAI",
+            sku: "GlobalStandard",
+            capacity: 10,
+            state: "Succeeded",
+          },
+        ],
+        deployments_error: "",
+        deployments_limited: false,
+        workspaces: [
+          {
+            workspace_id: connection.workspace_id,
+            name: "fixture-logs",
+            resource_id:
+              "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/test/providers/Microsoft.OperationalInsights/workspaces/fixture-logs",
+            location: "eastus2",
+            settings: ["fixture"],
+            request_logs: true,
+            usage_logs: true,
+            dedicated: false,
+            error: "",
+          },
+        ],
+        other_destinations: [],
+        diagnostics_error: "",
+      };
     else throw new Error(`Unexpected test request: ${path}`);
     await route.fulfill({
       contentType: "application/json",
@@ -347,29 +412,44 @@ async function fixtureApi(page: Page) {
   };
 }
 
-test("request, dual timelines, evidence and log-only requery", async ({
+test("request, call timeline, log discovery and log-only requery", async ({
   page,
 }, testInfo) => {
   const fixture = await fixtureApi(page);
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
   await page.goto("/");
+  const picker = page.getByRole("combobox", { name: /Foundry 资源/ });
+  await expect(picker).toHaveValue("example");
+  await expect(page.getByLabel(/^Deployment/)).toHaveValue(
+    "browser-test-fixture",
+  );
+  await expect(page.getByRole("group", { name: "诊断设置目标" })).toContainText(
+    "fixture-logs",
+  );
   await page.getByRole("button", { name: "执行请求" }).click();
   await expect(
     page.getByText("azure-browser-fixture", { exact: true }),
   ).toBeVisible();
-  await expect(page.getByText("候选 · 待核验", { exact: true })).toBeVisible();
+  await expect(page.getByText("候选 · 待核验", { exact: true })).toHaveCount(2);
   const call = page.getByRole("region", { name: "调用时间轴", exact: true });
-  const logs = page.getByRole("region", {
-    name: "日志发现时间轴",
-    exact: true,
-  });
+  const logs = page.getByRole("region", { name: "日志发现", exact: true });
   await expect(call.getByText("HTTP 请求 · 等待响应头")).toBeVisible();
   await expect(
     call.getByText("Azure 服务端处理（RequestResponse）"),
   ).toBeVisible();
-  await expect(logs.getByText("等待下一次日志查询")).toBeVisible();
-  await expect(logs.getByText("入库 · RequestResponse")).toBeVisible();
+  await expect(logs).toContainText("0/2 类日志已找到 · 1 类待核验 · 查询 2 次");
+  const requestLog = logs.getByRole("button", { name: /请求日志/ });
+  await expect(requestLog).toContainText("候选 · 待核验");
+  await expect(requestLog).toContainText("requestId_s = apim-request-id");
+  await expect(requestLog).not.toContainText("✓");
+  await expect(requestLog).toContainText("900.0 ms");
+  await expect(requestLog).toContainText("请求开始后约 9.00 s 可查询");
+  await expect(
+    logs.locator(".discovery-item").filter({ hasText: "用量日志" }),
+  ).toContainText("未找到");
+  await expect(logs.getByLabel("查询过程")).toContainText("第 1 次 · 1 条");
+  await expect(logs.locator(".lane-track, .track")).toHaveCount(0);
   await expect(
     page.getByRole("region", { name: "服务端自报阶段" }),
   ).toContainText("服务末 token");
@@ -396,6 +476,10 @@ test("request, dual timelines, evidence and log-only requery", async ({
     path: testInfo.outputPath("desktop.png"),
     fullPage: true,
   });
+  await requestLog.click();
+  await expect(page.locator(".detail-content")).toContainText(
+    "since_run_start_ms",
+  );
   await call.getByRole("button", { name: /收到响应头/ }).click();
   await expect(page.locator(".detail-content")).toContainText(
     "apim-request-id",
@@ -436,7 +520,7 @@ test("phone layout has no page-wide horizontal overflow", async ({
   );
   expect(overflow).toBeLessThanOrEqual(1);
   await expect(
-    page.getByRole("region", { name: "日志发现时间轴", exact: true }),
+    page.getByRole("region", { name: "日志发现", exact: true }),
   ).toBeVisible();
   await page.evaluate(() => document.fonts.ready);
   await page.screenshot({
@@ -479,6 +563,11 @@ test("historical lookup across Foundry resources without model calls", async ({
   await expect(
     page.getByRole("region", { name: "调用时间轴", exact: true }),
   ).toContainText("Azure 服务端处理（RequestResponse）");
+  const discovery = page.getByRole("region", { name: "日志发现", exact: true });
+  await expect(discovery).toContainText("1/2 类日志已找到");
+  await expect(
+    discovery.getByRole("button", { name: /请求日志/ }),
+  ).toContainText("CorrelationId = apim-request-id ✓");
   const raw = page.getByRole("region", { name: "原始 Log Analytics 日志" });
   await expect(raw.locator(".raw-line.hl-match")).toContainText(
     "= apim-request-id ✓",

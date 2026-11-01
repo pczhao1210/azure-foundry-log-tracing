@@ -27,19 +27,17 @@ export function timelineGeometry(events: TimelineEvent[], clock: number) {
 
 export function Timeline({
   events,
-  lane,
   selected,
   onSelect,
   emptyText = "执行请求后展示真实阶段；未采集的内部阶段不会被推测。",
 }: {
   events: TimelineEvent[];
-  lane: "call" | "logs";
   selected?: string;
   onSelect: (event: TimelineEvent) => void;
   emptyText?: string;
 }) {
   const [clock, setClock] = useState(Date.now());
-  const rows = events.filter((event) => event.lane === lane);
+  const rows = events.filter((event) => event.lane === "call");
   const running = rows.some((event) => event.status === "running");
   useEffect(() => {
     if (!running) return;
@@ -48,16 +46,11 @@ export function Timeline({
   }, [running]);
   const { dated, start, span } = timelineGeometry(rows, clock);
   return (
-    <section
-      className="timeline-section"
-      aria-label={lane === "call" ? "调用时间轴" : "日志发现时间轴"}
-    >
+    <section className="timeline-section" aria-label="调用时间轴">
       <div className="section-heading">
         <div>
-          <span className="eyebrow">
-            {lane === "call" ? "EXECUTION" : "LOG DISCOVERY"}
-          </span>
-          <h3>{lane === "call" ? "调用时间轴" : "日志发现时间轴"}</h3>
+          <span className="eyebrow">EXECUTION</span>
+          <h3>调用时间轴</h3>
         </div>
         <span className="quiet">
           {dated.length ? `${dated.length} 个阶段 / 事件` : "等待运行"}
@@ -122,24 +115,13 @@ export function Timeline({
           })}
         </div>
       )}
-      {lane === "call" && (
-        <p className="legend">
-          <i className="legend-blue" />
-          本地实测区间
-          <i className="legend-purple" />
-          Azure 诊断日志（服务时钟，可能存在时钟偏差）
-          <span>用量日志阶段起点按 requestTime 近似对齐</span>
-        </p>
-      )}
-      {lane === "logs" && (
-        <p className="legend">
-          <i className="legend-blue" />
-          本地查询与等待
-          <i className="legend-purple" />
-          Azure 入库时间 ingestion_time()
-          <span>不计入模型执行耗时</span>
-        </p>
-      )}
+      <p className="legend">
+        <i className="legend-blue" />
+        本地实测区间
+        <i className="legend-purple" />
+        Azure 诊断日志（服务时钟，可能存在时钟偏差）
+        <span>用量日志阶段起点按 requestTime 近似对齐</span>
+      </p>
     </section>
   );
 }

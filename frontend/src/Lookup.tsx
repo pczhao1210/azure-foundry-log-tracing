@@ -8,6 +8,7 @@ import {
   Search,
 } from "lucide-react";
 import { Timeline } from "./Timeline";
+import { LogDiscovery } from "./LogDiscovery";
 import { ThroughputBreakdown } from "./Throughput";
 import { RawLogPanel } from "./RawLogs";
 import { formatTps, tokenCount, tpsBases, type TpsInput } from "./metrics";
@@ -18,6 +19,7 @@ import {
   lookupResourcesSchema,
   milliseconds,
   rawLogsSchema,
+  resourceName,
   traceSchema,
   type Candidate,
   type Candidates,
@@ -51,10 +53,6 @@ export function localInput(ms: number): string {
 export function isoFromLocal(value: string): string | null {
   const ms = Date.parse(value);
   return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
-}
-
-export function resourceName(id: string): string {
-  return id.split("/").filter(Boolean).at(-1) ?? id;
 }
 
 function shortId(value: string): string {
@@ -711,22 +709,24 @@ function TraceView({
       <div className="card timeline-card">
         <Timeline
           events={trace.events}
-          lane="call"
           selected={selected}
           onSelect={(item) => setSelected(item.id)}
           emptyText="没有可绘制的 Azure 服务端阶段。"
         />
         <p className="hint lookup-note">
-          外部调用没有客户端阶段：时间轴只包含 Azure
-          日志中的服务端区间、用量日志阶段和入库时间点。
+          回查没有客户端阶段：时间轴只包含 Azure
+          日志中的服务端区间和用量日志阶段。
         </p>
         <ThroughputBreakdown run={input} />
-        <Timeline
+        <LogDiscovery
+          logs={trace.logs}
           events={trace.events}
-          lane="logs"
+          usageExpected={
+            !request ||
+            String(request.fields.ResultSignature ?? "").startsWith("2")
+          }
           selected={selected}
           onSelect={(item) => setSelected(item.id)}
-          emptyText="没有入库时间点。"
         />
       </div>
 

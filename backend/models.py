@@ -107,6 +107,14 @@ class Connection(BaseModel):
             raise ValueError("A verified mapping requires an explicit log ID field.")
         return self
 
+    def account_mismatch(self) -> tuple[str, str] | None:
+        # Heuristic only: a custom subdomain may legitimately differ from the account name.
+        endpoint = (urlsplit(self.endpoint).hostname or "").split(".", 1)[0]
+        resource = self.resource_id.rsplit("/", 1)[-1] if self.resource_id else ""
+        if not endpoint or not resource or endpoint.lower() == resource.lower():
+            return None
+        return endpoint, resource
+
 
 class NewRun(BaseModel):
     connection: Connection
@@ -330,3 +338,92 @@ class Trace(BaseModel):
     raw_scope: str = ""
     raw_start: str | None = None
     raw_end: str | None = None
+
+
+class DiscoveryBase(BaseModel):
+    # Discovery reuses the log-query identity; it only reads Azure Resource Manager.
+    logs_auth_mode: Literal["managed_identity", "azure_cli"] = "managed_identity"
+    managed_identity_client_id: str = ""
+
+    @field_validator("managed_identity_client_id")
+    @classmethod
+    def client_id(cls, value: str) -> str:
+        return Connection.optional_uuid(value)
+
+
+class FoundryQuery(DiscoveryBase):
+    resource_id: str
+
+    @field_validator("resource_id")
+    @classmethod
+    def account_path(cls, value: str) -> str:
+        value = Connection.resource_path(value)
+        if not value:
+            raise ValueError("A Foundry resource ID is required.")
+        return value
+
+
+class FoundrySummary(BaseModel):
+    resource_id: str
+    name: str
+    location: str = ""
+    kind: str = ""
+    resource_group: str = ""
+    subscription_id: str = ""
+    subscription: str = ""
+    endpoint: str = ""
+
+
+class Foundries(BaseModel):
+    state: Literal["ok", "empty", "error"] = "empty"
+    message: str = ""
+    checked_at: str | None = None
+    items: list[FoundrySummary] = Field(default_factory=list)
+    limited: bool = False
+
+
+class FoundryDeployment(BaseModel):
+    name: str
+    model: str = ""
+    version: str = ""
+    format: str = ""
+    sku: str = ""
+    capacity: int | None = None
+    state: str = ""
+
+
+class LogTarget(BaseModel):
+    # workspace_id is the Log Analytics customerId (GUID), not the ARM resource ID.
+    workspace_id: str = ""
+    name: str = ""
+    resource_id: str = ""
+    location: str = ""
+    settings: list[str] = Field(default_factory=list)
+    request_logs: bool = False
+    usage_logs: bool = False
+    # Resource-specific tables instead of AzureDiagnostics, which this lab queries.
+    dedicated: bool = False
+    error: str = ""
+
+
+class OtherDestination(BaseModel):
+    setting: str
+    kind: Literal["storage", "event_hub", "partner"]
+    name: str = ""
+
+
+class FoundryDetail(BaseModel):
+    state: Literal["ok", "partial", "error"] = "ok"
+    message: str = ""
+    checked_at: str | None = None
+    resource_id: str
+    name: str = ""
+    location: str = ""
+    kind: str = ""
+    endpoint: str = ""
+    deployments: list[FoundryDeployment] = Field(default_factory=list)
+    deployments_error: str = ""
+    deployments_limited: bool = False
+    workspaces: list[LogTarget] = Field(default_factory=list)
+    other_destinations: list[OtherDestination] = Field(default_factory=list)
+    diagnostics_error: str = ""

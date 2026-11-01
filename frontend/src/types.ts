@@ -162,6 +162,7 @@ export const traceSchema = z.object({
 });
 export type Connection = z.infer<typeof connectionSchema>;
 export type Run = z.infer<typeof runSchema>;
+export type LogResult = z.infer<typeof logSchema>;
 export type TimelineEvent = z.infer<typeof eventSchema>;
 export type History = z.infer<typeof historySchema>;
 export type Check = z.infer<typeof checkSchema>;
@@ -170,6 +171,74 @@ export type LookupResources = z.infer<typeof lookupResourcesSchema>;
 export type Candidates = z.infer<typeof candidatesSchema>;
 export type Candidate = Candidates["rows"][number];
 export type Trace = z.infer<typeof traceSchema>;
+
+export const foundriesSchema = z.object({
+  state: z.enum(["ok", "empty", "error"]),
+  message: z.string(),
+  checked_at: z.string().nullable(),
+  items: z.array(
+    z.object({
+      resource_id: z.string(),
+      name: z.string(),
+      location: z.string(),
+      kind: z.string(),
+      resource_group: z.string(),
+      subscription_id: z.string(),
+      subscription: z.string(),
+      endpoint: z.string(),
+    }),
+  ),
+  limited: z.boolean(),
+});
+export const foundryDetailSchema = z.object({
+  state: z.enum(["ok", "partial", "error"]),
+  message: z.string(),
+  checked_at: z.string().nullable(),
+  resource_id: z.string(),
+  name: z.string(),
+  location: z.string(),
+  kind: z.string(),
+  endpoint: z.string(),
+  deployments: z.array(
+    z.object({
+      name: z.string(),
+      model: z.string(),
+      version: z.string(),
+      format: z.string(),
+      sku: z.string(),
+      capacity: z.number().nullable(),
+      state: z.string(),
+    }),
+  ),
+  deployments_error: z.string(),
+  deployments_limited: z.boolean(),
+  workspaces: z.array(
+    z.object({
+      workspace_id: z.string(),
+      name: z.string(),
+      resource_id: z.string(),
+      location: z.string(),
+      settings: z.array(z.string()),
+      request_logs: z.boolean(),
+      usage_logs: z.boolean(),
+      dedicated: z.boolean(),
+      error: z.string(),
+    }),
+  ),
+  other_destinations: z.array(
+    z.object({
+      setting: z.string(),
+      kind: z.enum(["storage", "event_hub", "partner"]),
+      name: z.string(),
+    }),
+  ),
+  diagnostics_error: z.string(),
+});
+export type Foundries = z.infer<typeof foundriesSchema>;
+export type Foundry = Foundries["items"][number];
+export type FoundryDetail = z.infer<typeof foundryDetailSchema>;
+export type Deployment = FoundryDetail["deployments"][number];
+export type LogTarget = FoundryDetail["workspaces"][number];
 
 export const labels: Record<string, string> = {
   queued: "排队中",
@@ -221,6 +290,28 @@ export function milliseconds(value: number): string {
   return value >= 1000
     ? `${(value / 1000).toFixed(2)} s`
     : `${value.toFixed(1)} ms`;
+}
+
+export function resourceName(id: string): string {
+  return id.split("/").filter(Boolean).at(-1) ?? id;
+}
+
+// Heuristic only: a custom subdomain may legitimately differ from the account name.
+export function accountMismatch(
+  endpoint: string,
+  resourceId: string,
+): [string, string] | null {
+  let host = "";
+  try {
+    host = new URL(endpoint.trim()).hostname;
+  } catch {
+    return null;
+  }
+  const account = host.split(".")[0];
+  const resource = resourceId.trim() ? resourceName(resourceId.trim()) : "";
+  if (!account || !resource || account.toLowerCase() === resource.toLowerCase())
+    return null;
+  return [account, resource];
 }
 
 export function eventName(title: string): string {

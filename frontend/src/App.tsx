@@ -19,12 +19,20 @@ import {
   Workflow,
 } from "lucide-react";
 import { LatencyBreakdown, Timeline } from "./Timeline";
+import { LogDiscovery } from "./LogDiscovery";
 import { ThroughputBreakdown } from "./Throughput";
 import { RunRawLogs } from "./RawLogs";
 import { Lookup } from "./Lookup";
+import {
+  DeploymentField,
+  FoundryPicker,
+  LogTargets,
+  useFoundryDiscovery,
+} from "./Discovery";
 import { tpsBases } from "./metrics";
 import { Badge, Json } from "./ui";
 import {
+  accountMismatch,
   api,
   checkSchema,
   configSchema,
@@ -130,6 +138,11 @@ export default function App() {
     setCheck(null);
   }
 
+  const discovery = useFoundryDiscovery(config, (change) => {
+    setConfig((current) => (current ? change(current) : current));
+    setCheck(null);
+  });
+
   function selectRun(value: Run) {
     selection.current = value.id;
     setRun(value);
@@ -168,6 +181,11 @@ export default function App() {
   }
 
   const event = run?.events.find((item) => item.id === selected);
+  // ARM reports the real endpoint, so a custom subdomain is not a mismatch.
+  const mismatch =
+    config && discovery.detail?.endpoint !== config.endpoint
+      ? accountMismatch(config.endpoint, config.resource_id)
+      : null;
   const callDuration = run?.duration_ms ?? null;
   const totalTokens = run?.usage.total_tokens;
   const endToEndTps = run
@@ -242,6 +260,7 @@ export default function App() {
                 <p className="quiet">读取配置中…</p>
               ) : (
                 <>
+                  <FoundryPicker discovery={discovery} config={config} />
                   <label>
                     Foundry Endpoint
                     <input
@@ -250,14 +269,11 @@ export default function App() {
                       placeholder="https://resource.openai.azure.com"
                     />
                   </label>
-                  <label>
-                    Deployment
-                    <input
-                      value={config.deployment}
-                      onChange={(e) => update("deployment", e.target.value)}
-                      placeholder="部署名称"
-                    />
-                  </label>
+                  <DeploymentField
+                    detail={discovery.detail}
+                    value={config.deployment}
+                    onChange={(value) => update("deployment", value)}
+                  />
                   <div className="field-label">模型认证</div>
                   <div className="segmented">
                     <button
@@ -301,6 +317,11 @@ export default function App() {
                     <Database size={16} />
                     Log Analytics
                   </h3>
+                  <LogTargets
+                    detail={discovery.detail}
+                    workspaceId={config.workspace_id}
+                    onUse={(value) => update("workspace_id", value)}
+                  />
                   <label>
                     Workspace ID
                     <input
@@ -318,6 +339,14 @@ export default function App() {
                       placeholder="/subscriptions/…/providers/Microsoft.CognitiveServices/accounts/…"
                     />
                   </label>
+                  {mismatch && (
+                    <div className="credential-note warn" role="alert">
+                      Endpoint 账户 <code>{mismatch[0]}</code> 与 Resource ID
+                      账户 <code>{mismatch[1]}</code> 不一致。日志查询按
+                      Resource ID
+                      过滤，若两者不是同一资源，将查不到这次调用的日志。
+                    </div>
+                  )}
                   <label>
                     日志查询身份
                     <select
@@ -699,7 +728,6 @@ export default function App() {
               <div className="card timeline-card">
                 <Timeline
                   events={run?.events ?? []}
-                  lane="call"
                   selected={selected}
                   onSelect={(item) => {
                     setSelected(item.id);
@@ -708,9 +736,12 @@ export default function App() {
                 />
                 <LatencyBreakdown usage={run?.usage ?? {}} />
                 <ThroughputBreakdown run={run} />
-                <Timeline
+                <LogDiscovery
+                  logs={run?.logs ?? null}
                   events={run?.events ?? []}
-                  lane="logs"
+                  usageExpected={
+                    !run || !["failed", "cancelled"].includes(run.status)
+                  }
                   selected={selected}
                   onSelect={(item) => {
                     setSelected(item.id);

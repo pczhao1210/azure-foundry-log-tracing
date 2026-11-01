@@ -5,15 +5,22 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import App from "./App";
 import { LatencyBreakdown, Timeline, timelineGeometry } from "./Timeline";
+import { LogDiscovery } from "./LogDiscovery";
 import { ThroughputBreakdown } from "./Throughput";
 import { RunRawLogs } from "./RawLogs";
 import { formatTps, tokenCount, tpsBases } from "./metrics";
+import { applyDetail, LogTargets } from "./Discovery";
 import {
+  accountMismatch,
   api,
   connectionSchema,
+  foundriesSchema,
+  foundryDetailSchema,
+  logSchema,
   runSchema,
   traceSchema,
   type TimelineEvent,
@@ -36,6 +43,79 @@ const connection = connectionSchema.parse({
   log_id_field: "",
   mapping_verified: false,
 });
+const accountPrefix =
+  "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/test/providers/Microsoft.CognitiveServices/accounts/";
+const japanWorkspace = "00000000-0000-0000-0000-000000000009";
+const foundries = foundriesSchema.parse({
+  state: "ok",
+  message: "找到 3 个可访问的 Foundry / Azure OpenAI 资源。",
+  checked_at: "2026-11-01T04:00:00Z",
+  limited: false,
+  items: ["example", "japan-lab", "storage-only"].map((name, index) => ({
+    resource_id: `${accountPrefix}${name}`,
+    name,
+    location: ["eastus2", "japaneast", "westus"][index],
+    kind: index ? "AIServices" : "OpenAI",
+    resource_group: "test",
+    subscription_id: "00000000-0000-0000-0000-000000000001",
+    subscription: "Lab subscription",
+    endpoint: `https://${name}.${index ? "cognitiveservices" : "openai"}.azure.com/openai/v1`,
+  })),
+});
+function logTarget(workspaceId: string, name: string) {
+  return {
+    workspace_id: workspaceId,
+    name,
+    resource_id: `/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/logs/providers/Microsoft.OperationalInsights/workspaces/${name}`,
+    location: "eastus2",
+    settings: ["to-workspace"],
+    request_logs: true,
+    usage_logs: true,
+    dedicated: false,
+    error: "",
+  };
+}
+function foundryDetail(resourceId: string) {
+  const item = foundries.items.find(
+    (value) => value.resource_id === resourceId,
+  )!;
+  const deployment = (name: string) => ({
+    name,
+    model: name,
+    version: "2026-01-01",
+    format: "OpenAI",
+    sku: "GlobalStandard",
+    capacity: 10,
+    state: "Succeeded",
+  });
+  return foundryDetailSchema.parse({
+    state: "ok",
+    message: "",
+    checked_at: "2026-11-01T04:00:00Z",
+    resource_id: item.resource_id,
+    name: item.name,
+    location: item.location,
+    kind: item.kind,
+    endpoint: item.endpoint,
+    deployments:
+      item.name === "example"
+        ? [deployment("test-deployment"), deployment("gpt-4o")]
+        : [deployment("gpt-4o"), deployment("gpt-5-mini")],
+    deployments_error: "",
+    deployments_limited: false,
+    workspaces:
+      item.name === "example"
+        ? [logTarget(connection.workspace_id, "lab-logs")]
+        : item.name === "japan-lab"
+          ? [logTarget(japanWorkspace, "japan-logs")]
+          : [],
+    other_destinations:
+      item.name === "storage-only"
+        ? [{ setting: "policy", kind: "storage", name: "archive" }]
+        : [],
+    diagnostics_error: "",
+  });
+}
 const event: TimelineEvent = {
   id: "event-1",
   title: "Authentication",
@@ -269,6 +349,9 @@ function mockApi() {
       else if (input === "/api/lookup/resources") payload = lookupResources;
       else if (input === "/api/lookup/candidates") payload = candidates;
       else if (input === "/api/lookup/raw-logs") payload = rawLogs;
+      else if (input === "/api/discovery/foundries") payload = foundries;
+      else if (input === "/api/discovery/foundry")
+        payload = foundryDetail((body as { resource_id: string }).resource_id);
       else if (input === "/api/lookup/trace") {
         const id = (body as { request_id: string }).request_id;
         payload =
@@ -313,13 +396,46 @@ describe("request lab", () => {
     );
   });
 
+  it("warns when the endpoint and log resource point at different accounts", async () => {
+    mockApi();
+    render(<App />);
+    await screen.findByText("API Key 已在服务端配置，不会返回浏览器。");
+    expect(screen.queryByRole("alert")).toBeNull();
+    fireEvent.change(screen.getByLabelText("Foundry Endpoint"), {
+      target: {
+        value: "https://other-region.cognitiveservices.azure.com/openai/v1",
+      },
+    });
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toContain("other-region");
+    expect(alert.textContent).toContain("example");
+    expect(alert.textContent).toContain("将查不到这次调用的日志");
+    fireEvent.change(screen.getByLabelText("Foundry Endpoint"), {
+      target: { value: "https://EXAMPLE.openai.azure.com" },
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("compares account names only when both values are usable", () => {
+    const id = connection.resource_id;
+    expect(accountMismatch("https://example.openai.azure.com", id)).toBeNull();
+    expect(accountMismatch("not a url", id)).toBeNull();
+    expect(accountMismatch("https://other.openai.azure.com", "")).toBeNull();
+    expect(
+      accountMismatch("https://other.services.ai.azure.com/openai/v1", id),
+    ).toEqual(["other", "example"]);
+  });
+
   it("shows native IDs, candidates and event details without pretending they are verified", async () => {
     const calls = mockApi();
     render(<App />);
     await screen.findByText("API Key 已在服务端配置，不会返回浏览器。");
     fireEvent.click(screen.getByRole("button", { name: "执行请求" }));
     await screen.findByText("azure-123");
-    expect(screen.getByText("候选 · 待核验")).toBeTruthy();
+    expect(screen.getAllByText("候选 · 待核验")).toHaveLength(2);
+    expect(
+      screen.getByRole("region", { name: "日志发现" }).textContent,
+    ).toContain("候选 · 待核验");
     expect(screen.getByText("East US 2")).toBeTruthy();
     expect(screen.queryByText("精确匹配")).toBeNull();
     expect(screen.getByText(run.answer!)).toBeTruthy();
@@ -394,7 +510,6 @@ describe("timeline evidence", () => {
             duration_ms: 60000,
           },
         ]}
-        lane="call"
         onSelect={onSelect}
       />,
     );
@@ -424,7 +539,6 @@ describe("timeline evidence", () => {
           },
           event,
         ]}
-        lane="call"
         onSelect={() => {}}
       />,
     );
@@ -476,7 +590,6 @@ describe("timeline evidence", () => {
             status: "error",
           },
         ]}
-        lane="call"
         onSelect={() => {}}
       />,
     );
@@ -641,7 +754,15 @@ describe("historical lookup", () => {
     const tps = screen.getByRole("region", { name: "TPS 对比" });
     expect(tps.textContent).toContain("62.7 tok/s");
     expect(tps.textContent).toContain("回查仅含 Azure 日志，无客户端数据");
-    await screen.findByText(/= apim-request-id ✓/);
+    const raw = screen.getByRole("region", {
+      name: "原始 Log Analytics 日志",
+    });
+    await waitFor(() =>
+      expect(raw.textContent).toContain("= apim-request-id ✓"),
+    );
+    expect(
+      screen.getByRole("region", { name: "日志发现" }).textContent,
+    ).toContain("2/2 类日志已找到");
     expect(lastBody(calls, "/api/lookup/raw-logs")).toEqual({
       connection,
       request_id: "azure-123",
@@ -733,5 +854,270 @@ describe("historical lookup", () => {
       end: "2026-10-01T05:20:00.000Z",
     });
     expect(screen.queryByRole("button", { name: /打开本地实验/ })).toBeNull();
+  });
+});
+
+describe("log discovery", () => {
+  const RESOURCE =
+    "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/test/providers/Microsoft.CognitiveServices/accounts/foundry-a";
+  const baseLogs = {
+    state: "pending",
+    message: "",
+    query: "",
+    checked_at: null,
+    attempts: 2,
+    polling: true,
+    limited: false,
+    records: [],
+    id_fields: ["CorrelationId"],
+    missing: [],
+  };
+  const request = {
+    timestamp: "2026-10-31T12:00:00.100Z",
+    ingested_at: "2026-10-31T12:01:30.100Z",
+    category: "RequestResponse",
+    resource: RESOURCE,
+    fields: {
+      OperationName: "ChatCompletions_Create",
+      ResultSignature: "200",
+      DurationMs: 812,
+      promptTokens: 20,
+      completionTokens: 9,
+    },
+    matching_fields: ["CorrelationId"],
+  };
+  const query = (id: string, status: TimelineEvent["status"], count?: number) =>
+    ({
+      ...event,
+      id,
+      lane: "logs",
+      source: "log_query",
+      title: "Read-only Log Analytics query",
+      status,
+      details: count === undefined ? {} : { record_count: count },
+    }) satisfies TimelineEvent;
+
+  it("lists each log category with its evidence instead of a time axis", () => {
+    const onSelect = vi.fn();
+    const ingestion: TimelineEvent = {
+      ...event,
+      id: "ingest-rr",
+      lane: "logs",
+      source: "azure",
+      kind: "point",
+      title: "Azure ingestion: RequestResponse",
+      status: "observed",
+      details: {
+        category: "RequestResponse",
+        TimeGenerated: request.timestamp,
+        since_run_start_ms: 92000,
+      },
+    };
+    render(
+      <LogDiscovery
+        logs={logSchema.parse({ ...baseLogs, records: [request] })}
+        events={[
+          query("q1", "success", 0),
+          query("q2", "success", 1),
+          {
+            ...event,
+            id: "wait",
+            lane: "logs",
+            source: "log_query",
+            title: "Waiting before next log query",
+            status: "running",
+          },
+          ingestion,
+        ]}
+        onSelect={onSelect}
+      />,
+    );
+    const region = screen.getByRole("region", { name: "日志发现" });
+    expect(region.textContent).toContain("1/2 类日志已找到 · 查询 2 次");
+    expect(region.querySelector(".lane-track")).toBeNull();
+
+    const found = screen.getByRole("button", { name: /请求日志/ });
+    expect(found.textContent).toContain("已找到");
+    expect(found.textContent).toContain("CorrelationId ✓");
+    expect(found.textContent).toContain("ChatCompletions_Create");
+    expect(found.textContent).toContain("812.0 ms");
+    expect(found.textContent).toContain("20 → 9");
+    expect(found.textContent).toContain("foundry-a");
+    expect(found.textContent).toContain("请求开始后约 92 s 可查询");
+    fireEvent.click(found);
+    expect(onSelect).toHaveBeenCalledWith(ingestion);
+
+    const usage = screen.getByText("用量日志").closest(".discovery-item")!;
+    expect(usage.tagName).toBe("DIV");
+    expect(usage.textContent).toContain("等待入库");
+
+    const steps = screen.getByLabelText("查询过程");
+    expect(steps.textContent).toContain("第 1 次 · 无结果");
+    expect(steps.textContent).toContain("第 2 次 · 1 条");
+    expect(steps.textContent).toContain("等待下一次查询");
+    fireEvent.click(screen.getByRole("button", { name: "第 2 次 · 1 条" }));
+    expect(onSelect).toHaveBeenLastCalledWith(
+      expect.objectContaining({ id: "q2" }),
+    );
+  });
+
+  it("marks usage logs as not applicable for failed calls", () => {
+    render(
+      <LogDiscovery
+        logs={logSchema.parse({
+          ...baseLogs,
+          state: "matched",
+          polling: false,
+          records: [{ ...request, fields: { ResultSignature: "429" } }],
+        })}
+        events={[]}
+        usageExpected={false}
+        onSelect={() => {}}
+      />,
+    );
+    expect(screen.getByText("1/1 类日志已找到 · 查询 2 次")).toBeTruthy();
+    const usage = screen.getByText("用量日志").closest(".discovery-item")!;
+    expect(usage.textContent).toContain("不适用");
+    expect(screen.queryByLabelText("查询过程")).toBeNull();
+    expect(
+      screen.getByText("请求日志").closest(".discovery-item")!.textContent,
+    ).toContain("入库耗时约 90 s");
+  });
+
+  it("separates missing, candidate and unqueried states", () => {
+    const { rerender } = render(
+      <LogDiscovery
+        logs={logSchema.parse({
+          ...baseLogs,
+          state: "pending",
+          polling: false,
+        })}
+        events={[]}
+        onSelect={() => {}}
+      />,
+    );
+    expect(screen.getAllByText("未找到")).toHaveLength(2);
+    rerender(
+      <LogDiscovery
+        logs={logSchema.parse({
+          ...baseLogs,
+          state: "candidate",
+          polling: false,
+          records: [{ ...request, matching_fields: [] }],
+        })}
+        events={[]}
+        onSelect={() => {}}
+      />,
+    );
+    expect(screen.getByText("候选 · 待核验")).toBeTruthy();
+    expect(
+      screen.getByText("0/2 类日志已找到 · 1 类待核验 · 查询 2 次"),
+    ).toBeTruthy();
+    expect(screen.queryByText(/✓/)).toBeNull();
+    rerender(<LogDiscovery logs={null} events={[]} onSelect={() => {}} />);
+    expect(screen.getAllByText("未查询")).toHaveLength(2);
+    expect(screen.getByText("0/2 类日志已找到")).toBeTruthy();
+  });
+});
+
+describe("foundry discovery", () => {
+  async function ready() {
+    const calls = mockApi();
+    render(<App />);
+    await screen.findByText(/找到 3 个可访问的 Foundry/);
+    const picker = screen.getByRole("combobox", { name: /Foundry 资源/ });
+    await waitFor(() =>
+      expect(screen.getByLabelText(/^Deployment/).tagName).toBe("SELECT"),
+    );
+    return { calls, picker };
+  }
+
+  it("lists Foundry resources with the log identity and fills the connection", async () => {
+    const { calls, picker } = await ready();
+    expect(picker).toHaveProperty("value", "example");
+    expect(
+      calls.find((call) => call.url === "/api/discovery/foundries")?.body,
+    ).toEqual({ logs_auth_mode: "azure_cli", managed_identity_client_id: "" });
+    expect(screen.getByLabelText(/^Deployment/)).toHaveProperty(
+      "value",
+      "test-deployment",
+    );
+    expect(screen.getByText("当前")).toBeTruthy();
+    fireEvent.change(picker, { target: { value: "japan" } });
+    const listbox = screen.getByRole("listbox");
+    expect(within(listbox).getAllByRole("option")).toHaveLength(1);
+    fireEvent.click(within(listbox).getByRole("option", { name: /japan-lab/ }));
+    await waitFor(() =>
+      expect(screen.getByLabelText("Workspace ID")).toHaveProperty(
+        "value",
+        japanWorkspace,
+      ),
+    );
+    expect(picker).toHaveProperty("value", "japan-lab");
+    expect(screen.getByLabelText("Foundry Endpoint")).toHaveProperty(
+      "value",
+      "https://japan-lab.cognitiveservices.azure.com/openai/v1",
+    );
+    expect(screen.getByLabelText("Foundry Resource ID")).toHaveProperty(
+      "value",
+      `${accountPrefix}japan-lab`,
+    );
+    expect(screen.getByLabelText(/^Deployment/)).toHaveProperty(
+      "value",
+      "gpt-4o",
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(
+      calls.filter((call) => call.url === "/api/discovery/foundry").at(-1)
+        ?.body,
+    ).toEqual({
+      logs_auth_mode: "azure_cli",
+      managed_identity_client_id: "",
+      resource_id: `${accountPrefix}japan-lab`,
+    });
+    expect(
+      calls.some((call) => call.url.startsWith("/api/runs") && call.body),
+    ).toBe(false);
+  });
+
+  it("accepts a typed name and explains unknown names and missing log targets", async () => {
+    const { picker } = await ready();
+    fireEvent.change(picker, { target: { value: "nope" } });
+    fireEvent.keyDown(picker, { key: "Enter" });
+    expect(screen.getByRole("alert").textContent).toContain(
+      "未找到可访问的 Foundry「nope」",
+    );
+    fireEvent.change(picker, { target: { value: "STORAGE-ONLY" } });
+    fireEvent.keyDown(picker, { key: "Enter" });
+    const alert = await screen.findByText(/没有把请求日志（RequestResponse）/);
+    expect(alert.textContent).toContain("存储账户 archive");
+    expect(screen.getByLabelText("Workspace ID")).toHaveProperty(
+      "value",
+      connection.workspace_id,
+    );
+    expect(screen.getByLabelText(/^Deployment/)).toHaveProperty(
+      "value",
+      "gpt-4o",
+    );
+  });
+
+  it("keeps valid choices and flags a workspace outside the diagnostic targets", () => {
+    const detail = foundryDetail(`${accountPrefix}japan-lab`);
+    expect(
+      applyDetail({ ...connection, deployment: "gpt-5-mini" }, detail),
+    ).toMatchObject({ deployment: "gpt-5-mini", workspace_id: japanWorkspace });
+    const onUse = vi.fn();
+    render(
+      <LogTargets
+        detail={detail}
+        workspaceId={connection.workspace_id}
+        onUse={onUse}
+      />,
+    );
+    expect(screen.getByRole("alert").textContent).toContain("不是 japan-lab");
+    fireEvent.click(
+      screen.getByRole("button", { name: "使用 Workspace japan-logs" }),
+    );
+    expect(onUse).toHaveBeenCalledWith(japanWorkspace);
   });
 });

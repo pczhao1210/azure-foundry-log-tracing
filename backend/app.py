@@ -16,6 +16,10 @@ from .models import (
     CandidateQuery,
     Candidates,
     Connection,
+    DiscoveryBase,
+    Foundries,
+    FoundryDetail,
+    FoundryQuery,
     LookupBase,
     LookupResources,
     NewRun,
@@ -188,6 +192,14 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     @app.post("/api/lookup/raw-logs")
     async def lookup_raw(body: TraceQuery, request: Request) -> RawLogs:
         return await lookup(request, lambda engine: engine.lookup_raw(body))
+
+    @app.post("/api/discovery/foundries")
+    async def discovery_foundries(body: DiscoveryBase, request: Request) -> Foundries:
+        return await service(request).foundries(body)
+
+    @app.post("/api/discovery/foundry")
+    async def discovery_foundry(body: FoundryQuery, request: Request) -> FoundryDetail:
+        return await service(request).foundry(body)
 
     dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
     if dist.is_dir():

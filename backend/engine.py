@@ -28,11 +28,16 @@ from .azure import (
     resources_query,
     response_meta,
 )
+from .discovery import AzureDiscovery, describe
 from .models import (
     CandidateQuery,
     Candidates,
     Connection,
+    DiscoveryBase,
     Event,
+    Foundries,
+    FoundryDetail,
+    FoundryQuery,
     LogResult,
     LookupBase,
     LookupResources,
@@ -64,10 +69,12 @@ class Engine:
         client_factory: Callable[[], httpx.AsyncClient] | None = None,
         # Observed ingestion delays are about 1-2 minutes and differ per category.
         poll_delays: tuple[float, ...] = (0, 20, 30, 45, 60, 90, 120),
+        discovery: AzureDiscovery | None = None,
     ):
         self.settings = settings
         self.store = store
         self.logs = logs or AzureLogs()
+        self.discovery = discovery or AzureDiscovery()
         self.client_factory = client_factory or (
             lambda: httpx.AsyncClient(
                 timeout=httpx.Timeout(120, connect=15), follow_redirects=False
@@ -79,6 +86,7 @@ class Engine:
         self.log_tasks: dict[str, asyncio.Task[None]] = {}
         self.raw_locks: dict[str, asyncio.Lock] = {}
         self.lookup_slots = asyncio.Semaphore(2)
+        self.discovery_slots = asyncio.Semaphore(4)
 
     def get(self, run_id: str) -> Run | None:
         run = self.runs.get(run_id)
@@ -298,6 +306,13 @@ class Engine:
                     )
                 result.attempts = attempts
                 result.polling = True
+                mismatch = run.connection.account_mismatch()
+                if result.state == "pending" and mismatch:
+                    result.message += (
+                        f" 注意：Endpoint 账户为 {mismatch[0]}，但查询限定在资源 {mismatch[1]}；"
+                        "若两者不是同一资源，日志不会被查到。请核对 Foundry Resource ID，"
+                        "并确认该资源的诊断设置发送到此 Workspace。"
+                    )
                 if result.state in ("matched", "candidate"):
                     seen = {record.category for record in result.records if record.matching_fields}
                     result.missing = [
@@ -383,6 +398,36 @@ class Engine:
                 f"回查失败：{error_label(exc)}。"
                 "请检查身份、RBAC（需 Workspace 或表级读取权限）和网络。"
             )
+
+    async def discover(
+        self,
+        kind: str,
+        work: Callable[[], Awaitable[T]],
+        failed: Callable[[str], T],
+    ) -> T:
+        async with self.discovery_slots:
+            try:
+                async with asyncio.timeout(45):
+                    return await work()
+            except (AzureError, httpx.HTTPError, TimeoutError, ValueError) as exc:
+                logger.warning("Discovery failed: kind=%s type=%s", kind, type(exc).__name__)
+                return failed(f"资源发现失败：{describe(exc)}")
+
+    async def foundries(self, body: DiscoveryBase) -> Foundries:
+        return await self.discover(
+            "foundries",
+            lambda: self.discovery.foundries(body),
+            lambda message: Foundries(state="error", message=message, checked_at=now()),
+        )
+
+    async def foundry(self, body: FoundryQuery) -> FoundryDetail:
+        return await self.discover(
+            "foundry",
+            lambda: self.discovery.foundry(body),
+            lambda message: FoundryDetail(
+                state="error", message=message, checked_at=now(), resource_id=body.resource_id
+            ),
+        )
 
     async def lookup_resources(self, body: LookupBase) -> LookupResources:
         if not body.connection.workspace_id:

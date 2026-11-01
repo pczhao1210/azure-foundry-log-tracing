@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -23,11 +24,14 @@ from backend.azure import (
     resources_query,
     safe_fields,
 )
+from backend.discovery import AzureDiscovery
 from backend.engine import Engine
 from backend.models import (
     CandidateQuery,
     Connection,
+    DiscoveryBase,
     Event,
+    FoundryQuery,
     LogRecord,
     LogResult,
     LookupBase,
@@ -72,13 +76,14 @@ class FakeLogs:
         return result
 
 
-def engine_for(settings, handler, logs=None, delays=(0,)):
+def engine_for(settings, handler, logs=None, delays=(0,), discovery=None):
     return Engine(
         settings,
         Store(settings.database_path),
         logs=logs or FakeLogs(),
         client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         poll_delays=delays,
+        discovery=discovery,
     )
 
 
@@ -660,6 +665,35 @@ async def test_polling_reports_missing_category_when_schedule_ends(connection, s
     assert "重新查日志" in run.logs.message
 
 
+def test_account_mismatch_compares_endpoint_and_resource(connection):
+    assert connection.account_mismatch() is None
+    upper = connection.model_copy(update={"resource_id": RESOURCE.replace("example", "EXAMPLE")})
+    assert upper.account_mismatch() is None
+    assert connection.model_copy(update={"resource_id": ""}).account_mismatch() is None
+    other = connection.model_copy(update={"endpoint": "https://other.cognitiveservices.azure.com"})
+    assert other.account_mismatch() == ("other", "example")
+
+
+async def test_pending_logs_warn_about_endpoint_resource_mismatch(connection, settings):
+    async def handler(request):
+        return success_response()
+
+    other = connection.model_copy(
+        update={"endpoint": "https://other-region.cognitiveservices.azure.com/openai/v1"}
+    )
+    logs = FakeLogs([LogResult(state="pending", message="暂未查到。")])
+    engine = engine_for(settings, handler, logs)
+    run = engine.create(NewRun(connection=other, prompt="test"))
+    await settle(engine, run)
+    assert run.logs.state == "pending"
+    assert "Endpoint 账户为 other-region" in run.logs.message
+    assert "查询限定在资源 example" in run.logs.message
+
+    same = engine.create(NewRun(connection=connection, prompt="test"))
+    await settle(engine, same)
+    assert "Endpoint 账户" not in same.logs.message
+
+
 async def test_client_request_id_alone_does_not_trigger_log_query(connection, settings):
     sent = []
 
@@ -1128,4 +1162,261 @@ def test_lookup_api_guards_and_hides_errors(settings, connection):
         engine.lookup_slots.release()
         engine.lookup_slots.release()
     assert logs.calls == 1
+    assert Store(settings.database_path).list() == []
+
+
+ARM_HOST = "management.azure.com"
+WORKSPACE = (
+    "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/logs"
+    "/providers/Microsoft.OperationalInsights/workspaces/shared-logs"
+)
+LOCKED_WORKSPACE = (
+    "/subscriptions/00000000-0000-0000-0000-000000000003/resourceGroups/other"
+    "/providers/Microsoft.OperationalInsights/workspaces/locked-logs"
+)
+
+
+def discovery_for(handler, tokens=None):
+    tokens = [] if tokens is None else tokens
+
+    async def token(body):
+        tokens.append(body.logs_auth_mode)
+        return f"token-{len(tokens)}", time.time() + 3600
+
+    return AzureDiscovery(transport=httpx.MockTransport(handler), token=token)
+
+
+def arm_detail_handler(requests, next_link=None):
+    def handler(request):
+        requests.append(request)
+        assert request.headers["authorization"].startswith("Bearer token-")
+        path, version = request.url.path, request.url.params.get("api-version")
+        if path == RESOURCE:
+            assert version == "2024-10-01"
+            return httpx.Response(
+                200,
+                json={
+                    "name": "example",
+                    "location": "eastus2",
+                    "kind": "AIServices",
+                    "properties": {"endpoint": "https://example.cognitiveservices.azure.com/"},
+                },
+            )
+        if path == f"{RESOURCE}/deployments" and "$skiptoken" not in request.url.params:
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        {
+                            "name": "zeta",
+                            "sku": {"name": "GlobalStandard", "capacity": 50},
+                            "properties": {
+                                "model": {"name": "gpt-x", "version": "1", "format": "OpenAI"},
+                                "provisioningState": "Succeeded",
+                            },
+                        }
+                    ],
+                    "nextLink": next_link
+                    or f"https://{ARM_HOST}{RESOURCE}/deployments?api-version=2024-10-01"
+                    "&$skiptoken=page-2",
+                },
+            )
+        if path == f"{RESOURCE}/deployments":
+            assert version == "2024-10-01"
+            return httpx.Response(
+                200, json={"value": [{"name": "alpha", "sku": {"capacity": True}}, {"bad": 1}]}
+            )
+        if path == f"{RESOURCE}/providers/Microsoft.Insights/diagnosticSettings":
+            assert version == "2021-05-01-preview"
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        {
+                            "name": "everything",
+                            "properties": {
+                                "workspaceId": WORKSPACE,
+                                "storageAccountId": "/subscriptions/00000000-0000-0000-0000-"
+                                "000000000001/resourceGroups/logs/providers/"
+                                "Microsoft.Storage/storageAccounts/archive",
+                                "logs": [{"categoryGroup": "allLogs", "enabled": True}],
+                            },
+                        },
+                        {
+                            "name": "audit-only",
+                            "properties": {
+                                "workspaceId": WORKSPACE.upper().replace(
+                                    "/SUBSCRIPTIONS", "/subscriptions"
+                                ),
+                                "logs": [{"categoryGroup": "audit", "enabled": True}],
+                            },
+                        },
+                        {
+                            "name": "requests",
+                            "properties": {
+                                "workspaceId": LOCKED_WORKSPACE,
+                                "logAnalyticsDestinationType": "Dedicated",
+                                "logs": [
+                                    {"category": "RequestResponse", "enabled": True},
+                                    {"category": "AzureOpenAIRequestUsage", "enabled": False},
+                                ],
+                            },
+                        },
+                        {
+                            "name": "stream",
+                            "properties": {
+                                "eventHubAuthorizationRuleId": "/subscriptions/00000000-0000-"
+                                "0000-0000-000000000001/resourceGroups/logs/providers/"
+                                "Microsoft.EventHub/namespaces/hub/authorizationrules/send",
+                                "logs": [{"categoryGroup": "allLogs", "enabled": True}],
+                            },
+                        },
+                        {"name": "unsafe", "properties": {"workspaceId": "/not/a/workspace"}},
+                    ]
+                },
+            )
+        if path.lower() == WORKSPACE.lower():
+            assert version == "2023-09-01"
+            return httpx.Response(
+                200,
+                json={
+                    "name": "shared-logs",
+                    "location": "eastus2",
+                    "properties": {"customerId": "00000000-0000-0000-0000-00000000000A"},
+                },
+            )
+        if path == LOCKED_WORKSPACE:
+            return httpx.Response(403, json={"error": {"message": "secret ARM detail"}})
+        pytest.fail(f"Unexpected ARM request {request.method} {request.url}")
+
+    return handler
+
+
+def test_discovery_lists_accessible_foundries_from_resource_graph():
+    requests, tokens = [], []
+
+    def handler(request):
+        requests.append(request)
+        assert request.method == "POST"
+        assert request.url.host == ARM_HOST
+        assert request.url.path == "/providers/Microsoft.ResourceGraph/resources"
+        assert request.url.params["api-version"] == "2022-10-01"
+        body = json.loads(request.content)
+        assert "subscriptions" not in body
+        assert body["options"] == {"resultFormat": "objectArray", "$top": 201}
+        assert '"microsoft.cognitiveservices/accounts"' in body["query"]
+        return httpx.Response(
+            200,
+            json={
+                "resultTruncated": "false",
+                "data": [
+                    {
+                        "id": RESOURCE,
+                        "name": "example",
+                        "location": "eastus2",
+                        "kind": "AIServices",
+                        "resourceGroup": "test",
+                        "subscriptionId": "00000000-0000-0000-0000-000000000001",
+                        "subscription": "Lab subscription",
+                        "endpoint": "https://example.cognitiveservices.azure.com/",
+                    },
+                    {
+                        "id": RESOURCE.replace("example", "Alpha"),
+                        "name": "Alpha",
+                        "endpoint": "https://alpha.evil.example/",
+                    },
+                    {"id": "/subscriptions/x/providers/Microsoft.Web/sites/nope", "name": "x"},
+                    "not-an-object",
+                ],
+            },
+        )
+
+    discovery = discovery_for(handler, tokens)
+    body = DiscoveryBase(logs_auth_mode="azure_cli")
+    found = asyncio.run(discovery.foundries(body))
+    assert found.state == "ok" and not found.limited
+    assert [item.name for item in found.items] == ["Alpha", "example"]
+    assert found.items[0].endpoint == ""
+    assert found.items[1].endpoint == "https://example.cognitiveservices.azure.com/openai/v1"
+    assert found.items[1].subscription == "Lab subscription"
+    assert "2 个" in found.message
+    asyncio.run(discovery.foundries(body))
+    assert tokens == ["azure_cli"]
+    assert all(r.headers["authorization"] == "Bearer token-1" for r in requests)
+
+
+def test_discovery_detail_resolves_workspaces_deployments_and_destinations():
+    requests = []
+    discovery = discovery_for(arm_detail_handler(requests))
+    detail = asyncio.run(discovery.foundry(FoundryQuery(resource_id=RESOURCE)))
+    assert detail.endpoint == "https://example.cognitiveservices.azure.com/openai/v1"
+    assert (detail.name, detail.location, detail.kind) == ("example", "eastus2", "AIServices")
+    assert [item.name for item in detail.deployments] == ["alpha", "zeta"]
+    assert detail.deployments[0].capacity is None
+    assert detail.deployments[1].model_dump() == {
+        "name": "zeta",
+        "model": "gpt-x",
+        "version": "1",
+        "format": "OpenAI",
+        "sku": "GlobalStandard",
+        "capacity": 50,
+        "state": "Succeeded",
+    }
+    shared, locked = detail.workspaces
+    assert shared.workspace_id == "00000000-0000-0000-0000-00000000000a"
+    assert shared.settings == ["everything", "audit-only"]
+    assert (shared.request_logs, shared.usage_logs, shared.dedicated) == (True, True, False)
+    assert locked.workspace_id == "" and locked.name == "locked-logs"
+    assert (locked.request_logs, locked.usage_logs, locked.dedicated) == (True, False, True)
+    assert "Reader" in locked.error and "secret" not in locked.error
+    assert [(item.kind, item.name, item.setting) for item in detail.other_destinations] == [
+        ("storage", "archive", "everything"),
+        ("event_hub", "hub", "stream"),
+    ]
+    assert detail.state == "partial" and not detail.diagnostics_error
+    assert all(r.method == "GET" for r in requests)
+
+
+def test_discovery_refuses_next_link_outside_arm():
+    requests = []
+    handler = arm_detail_handler(requests, next_link="https://attacker.example/steal?$skiptoken=1")
+    detail = asyncio.run(discovery_for(handler).foundry(FoundryQuery(resource_id=RESOURCE)))
+    assert detail.deployments == [] and detail.deployments_error == "ValueError"
+    assert detail.state == "partial" and detail.workspaces
+    assert {r.url.host for r in requests} == {ARM_HOST}
+
+
+def test_discovery_api_validates_input_and_hides_arm_errors(settings):
+    tokens = []
+
+    def handler(request):
+        if request.url.path == RESOURCE:
+            return httpx.Response(404, json={"error": {"message": "secret ARM detail"}})
+        return httpx.Response(401, text="secret ARM detail")
+
+    async def model(request):
+        pytest.fail("Discovery must not call the model.")
+
+    engine = engine_for(settings, model, discovery=discovery_for(handler, tokens))
+    with TestClient(create_app(settings, engine), base_url="http://localhost") as client:
+        listed = client.post("/api/discovery/foundries", json={"logs_auth_mode": "azure_cli"})
+        assert listed.status_code == 200 and listed.json()["state"] == "error"
+        assert "Reader" in listed.json()["message"] and "secret" not in listed.text
+        client.post("/api/discovery/foundries", json={"logs_auth_mode": "azure_cli"})
+        assert tokens == ["azure_cli", "azure_cli"]
+        detail = client.post(
+            "/api/discovery/foundry",
+            json={"logs_auth_mode": "azure_cli", "resource_id": RESOURCE},
+        )
+        assert detail.json()["state"] == "error"
+        assert detail.json()["resource_id"] == RESOURCE
+        assert "404" in detail.json()["message"] and "secret" not in detail.text
+        for invalid in (
+            {"resource_id": ""},
+            {"resource_id": WORKSPACE},
+            {"resource_id": f"{RESOURCE}/../../other"},
+            {"resource_id": RESOURCE, "managed_identity_client_id": "not-a-guid"},
+        ):
+            assert client.post("/api/discovery/foundry", json=invalid).status_code == 422
+        assert client.post("/api/discovery/foundries", content="{}").status_code == 415
     assert Store(settings.database_path).list() == []
