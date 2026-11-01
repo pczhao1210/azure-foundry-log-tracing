@@ -132,11 +132,60 @@ def lab(tmp_path: Path):
 def test_help_and_invalid_arguments(lab: Lab):
     helped = lab.run("--help")
     assert helped.returncode == 0 and "--new" in helped.stdout and "new" in helped.stdout
+    assert "--stop" in helped.stdout and "--start" in helped.stdout
     bad = (["bogus"], ["--port", "abc"], ["--port", "0"], ["--port", "70000"])
-    for args in (*bad, ["--host", "-x"], ["--port"]):
+    conflicts = (["stop", "new"], ["--new", "--stop"], ["start", "stop"], ["--stop", "--start"])
+    for args in (*bad, *conflicts, ["--host", "-x"], ["--port"]):
         result = lab.run(*args)
         assert result.returncode == 2, args
         assert "用法" in result.stderr
+    assert lab.calls() == []
+
+
+@pytest.mark.parametrize("args", [(), ("start",), ("--start",), ("start", "--start")])
+def test_start_is_the_default_action(lab: Lab, args: tuple[str, ...]):
+    port = free_port()
+    assert lab.run(*args, "--port", str(port)).returncode == 0
+    assert lab.calls() == [
+        f"uv run --frozen uvicorn {APP} --factory --host 127.0.0.1 --port {port}"
+    ]
+
+
+@pytest.mark.parametrize("flag", ["stop", "--stop"])
+def test_stop_stops_the_backend_without_restarting(lab: Lab, flag: str):
+    lab.make_stale()
+    files = lab.database_files()
+    proc, port = lab.listener()
+    result = lab.run(flag, "--port", str(port))
+    assert result.returncode == 0, result.stderr
+    assert proc.wait(timeout=5) == -signal.SIGTERM
+    assert f"PID {proc.pid}" in result.stdout
+    assert all(file.exists() for file in files)
+    assert lab.calls() == []
+
+
+def test_stop_escalates_to_sigkill(lab: Lab):
+    proc, port = lab.listener(ignore_term=True)
+    result = lab.run("stop", "--port", str(port), STOP_TIMEOUT="1")
+    assert result.returncode == 0, result.stderr
+    assert proc.wait(timeout=5) == -signal.SIGKILL
+    assert "强制结束" in result.stderr
+
+
+def test_stop_without_a_running_backend_succeeds(lab: Lab):
+    result = lab.run("stop", "--port", str(free_port()))
+    assert result.returncode == 0, result.stderr
+    assert "无需停止" in result.stdout
+    assert lab.calls() == []
+
+
+def test_stop_never_kills_a_foreign_listener(lab: Lab):
+    proc, port = lab.listener(marker="unrelated-service")
+    result = lab.run("stop", "--port", str(port))
+    assert result.returncode == 0, result.stderr
+    assert proc.poll() is None
+    assert "无需停止" in result.stdout
+    assert f"PID {proc.pid}" in result.stderr
     assert lab.calls() == []
 
 

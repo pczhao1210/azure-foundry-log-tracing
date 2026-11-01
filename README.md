@@ -66,7 +66,8 @@ cp .env.example .env
 [start.sh](start.sh) 是日常启动入口，在任意目录执行都可以：
 
 ```bash
-./start.sh              # 重启：停掉遗留后端 → 按需构建前端 → 启动
+./start.sh              # 重启：停掉遗留后端 → 按需构建前端 → 启动（start / --start 等价）
+./start.sh stop         # 停止本项目的后端服务（--stop 等价）；用 --port 启动的需指定相同端口
 ./start.sh new          # 全新启动：先清空 SQLite 数据库再启动（--new 等价）
 ./start.sh --port 8010  # 换端口；--host 同理，默认 127.0.0.1:8000
 ```
@@ -74,6 +75,8 @@ cp .env.example .env
 - **遗留进程**：只停止“命令行含 `backend.app:create_app`、工作目录为本项目、正在监听目标端口”的进程。
   先发 SIGTERM，`STOP_TIMEOUT`（默认 10 秒）内未退出再 SIGKILL。端口被其他程序占用，或无法识别占用者时
   **不会强杀**，直接报错退出，请改用 `--port` 或自行处理。
+- **`stop`**：按同样规则停止目标端口上的后端后退出，不构建前端、不启动服务。没有运行中的服务时直接成功返回；
+  端口被其他程序占用时只提示、不处理。不能与 `new` 同时使用。
 - **`new`**：删除 `DATABASE_PATH` 指向的数据库及其 `-wal`/`-shm`/`-journal` 文件，**实验历史无法恢复**；
   数据库在启动时自动重建。清空发生在旧进程已停止、端口确认空闲之后，所以前端构建失败、
   配置读取失败或端口无法释放时，数据库保持原样。
@@ -81,7 +84,7 @@ cp .env.example .env
   构建失败会取消启动，**不会**停掉正在运行的旧进程。
 - **范围**：只处理目标端口上的进程。要并行运行第二个实例，请同时指定不同的 `--port` 和 `DATABASE_PATH`；
   否则后启动的实例会把先启动实例中进行中的请求标记为失败（启动时的中断恢复逻辑）。
-- 脚本在前台运行，Ctrl+C 停止。需要后台运行时用 `systemd`、tmux 等自行包装。
+- 脚本在前台运行，Ctrl+C 停止，也可以在另一个终端执行 `./start.sh stop`。需要后台运行时用 `systemd`、tmux 等自行包装。
 
 不使用脚本时，手工等价命令是：
 
@@ -347,7 +350,7 @@ npm run test:e2e --prefix frontend
 **Mock 测试不证明真实 Azure 关联成功**；真实验收需要配置自己的资源、身份与诊断字段。
 
 `tests/test_start_script.py` 用假的 `uv`/`npm` 和本地监听进程验证 [start.sh](start.sh)：只停止本项目的后端、
-拒绝强杀其他程序、`new` 的清库范围与顺序、构建失败不影响旧进程（仅 Linux，需要 `ss`）。
+拒绝强杀其他程序、`stop` 只停不启、`new` 的清库范围与顺序、构建失败不影响旧进程（仅 Linux，需要 `ss`）。
 脚本的静态检查：`uvx --from shellcheck-py shellcheck start.sh`。
 
 主要代码：[Python API](backend/app.py)、[执行引擎](backend/engine.py)、
