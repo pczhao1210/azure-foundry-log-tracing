@@ -252,7 +252,7 @@ export default function App() {
             <span className="eyebrow">OBSERVE. CORRELATE. VERIFY.</span>
             <h1>让每一次请求，都有据可循。</h1>
             <p>
-              调用 Foundry，读取真实诊断日志，用请求 ID 验证链路，而不是猜测。
+              调用 Foundry，读取 Azure 诊断日志，按请求 ID 精确关联每一次调用。
             </p>
           </div>
           <div className="mode-pill" aria-label="当前调用方式">
@@ -469,7 +469,7 @@ export default function App() {
                     {busy === "check" ? "检查中…" : "检查身份与日志连接"}
                   </button>
                   <p className="hint">
-                    不发起模型调用；MI Token 可用不等于模型 RBAC 已验证。
+                    只检查身份与日志查询，不调用模型；模型权限以实际请求结果为准。
                   </p>
                   {check && (
                     <div className="check-results">
@@ -708,7 +708,7 @@ export default function App() {
                   <strong>
                     {callDuration === null ? "—" : milliseconds(callDuration)}
                   </strong>
-                  <small>包括身份准备，不代表模型内部耗时</small>
+                  <small>含身份准备、网络与响应读取</small>
                 </div>
                 <div className="metric">
                   <span>Total tokens</span>
@@ -798,7 +798,7 @@ export default function App() {
                       (key) => key !== "x-ms-client-request-id",
                     ) && (
                       <p className="hint">
-                        尚未获得 Azure 请求 ID。不能仅凭时间相近认定请求对应。
+                        尚未获得 Azure 请求 ID，暂时无法关联日志。
                       </p>
                     )}
                     {Object.keys(run.response_meta).length > 0 && (
@@ -924,7 +924,7 @@ export default function App() {
                           </>
                         ) : (
                           <p className="quiet">
-                            点击时间轴或事件，查看真实时点、来源和数据。
+                            点击时间轴或事件，查看时点、来源和数据。
                           </p>
                         )}
                       </div>
@@ -957,7 +957,7 @@ export default function App() {
                         ))
                       ) : (
                         <p className="quiet">
-                          暂无匹配记录。查询延迟不等于请求未到达 Azure。
+                          暂无匹配记录。日志入库存在延迟，可稍后重新查询。
                         </p>
                       )}
                     </>
@@ -976,10 +976,6 @@ export default function App() {
               </section>
               <RunRawLogs run={run} />
             </div>
-            <footer>
-              不接入 OpenTelemetry · 不写入 Azure 自定义日志 ·
-              内部不可见阶段不作推测
-            </footer>
           </div>
         </div>
       </main>

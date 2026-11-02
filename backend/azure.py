@@ -31,7 +31,7 @@ from .models import (
 AZURE_ID_HEADERS = ("apim-request-id", "x-request-id", "x-ms-request-id", "request-id")
 CLIENT_ID_HEADER = "x-ms-client-request-id"
 REQUEST_HEADERS = (*AZURE_ID_HEADERS, CLIENT_ID_HEADER)
-# Verified 2026-11-01: RequestResponse and AzureOpenAIRequestUsage rows carry the
+# RequestResponse and AzureOpenAIRequestUsage rows carry the
 # response apim-request-id in CorrelationId; x-request-id and the client ID are not logged.
 BUILTIN_MAPPING = ("CorrelationId", "apim-request-id")
 META_HEADERS = (
@@ -462,7 +462,7 @@ def summarize(
     elif exact:
         state = "matched"
         message = f"精确匹配：{'、'.join(exact)}" + (
-            "（内置规则，已在真实 AzureDiagnostics 中验证）。"
+            "（内置规则）。"
             if any(pair.partition(" = ")[::2] == BUILTIN_MAPPING for pair in exact)
             else "（你已确认的字段映射）。"
         )
@@ -880,7 +880,7 @@ def log_events(records: list[LogRecord], created_at: str | None = None) -> list[
             phases = [("Azure usage log: full output (TTFT = TTLT)", first)]
             note = (
                 "TTFT 与 TTLT 相同（非流式 Chat Completions 的表现），"
-                "表示完整输出耗时，不是真实首 token；"
+                "表示完整输出耗时，而非首 token 时间；"
             )
         for title, duration in phases:
             events.append(

@@ -619,7 +619,7 @@ def test_service_intervals_use_request_time_not_aggregation_time(connection):
     assert service.duration_ms == 567
     ttft = call["Azure usage log: full output (TTFT = TTLT)"]
     assert ttft.started_at == service.started_at and ttft.duration_ms == 542.093
-    assert "不是真实首 token" in ttft.details["note"]
+    assert "而非首 token 时间" in ttft.details["note"]
     assert "Azure usage log: time to first token" not in call
     assert "Azure usage log: time to last token" not in call
     assert not any(event.started_at.startswith("2026-11-01T04:17:39") for event in run.events)

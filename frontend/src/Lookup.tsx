@@ -362,7 +362,7 @@ export function Lookup({
                 onChange={(e) =>
                   setFilters({ ...filters, deployment: e.target.value })
                 }
-                placeholder="可选，如 gpt-5.4-nano"
+                placeholder="可选，模型部署名称"
                 maxLength={64}
               />
             </label>

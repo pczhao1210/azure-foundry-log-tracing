@@ -29,7 +29,7 @@ export function Timeline({
   events,
   selected,
   onSelect,
-  emptyText = "执行请求后展示真实阶段；未采集的内部阶段不会被推测。",
+  emptyText = "执行请求后展示各阶段的时间轴。",
 }: {
   events: TimelineEvent[];
   selected?: string;
@@ -186,8 +186,8 @@ export function LatencyBreakdown({
         </div>
       )}
       <p className="legend">
-        Azure 未公开这些字段的定义：耗时值按大小排列，各自起点不一定相同；token
-        间隔单独列出。均无绝对时间，因此不与上方时间轴对齐。
+        耗时值按大小排列，各值起点可能不同；token
+        间隔单独列出。这些值没有绝对时间，因此不与上方时间轴对齐。
       </p>
     </section>
   );

@@ -1625,13 +1625,6 @@ button.discovery-item:hover {
 .discovery-steps button[aria-pressed="true"] {
   box-shadow: 0 0 0 2px #c9d6f5;
 }
-footer {
-  font-size: 9px;
-  text-align: center;
-  color: #9ca9bf;
-  padding: 24px 0;
-  letter-spacing: 0.3px;
-}
 .sr-only {
   position: absolute;
   width: 1px;

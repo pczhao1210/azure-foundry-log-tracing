@@ -653,7 +653,7 @@ export function LogTargets({
       )}
       {sending.some((item) => item.dedicated) && (
         <p className="hint warn-text">
-          “资源专用表”模式写入独立表，本实验查询的是 AzureDiagnostics。
+          “资源专用表”模式写入独立表，本工具查询的是 AzureDiagnostics。
         </p>
       )}
       {sending.length > 0 && others.length > 0 && (
